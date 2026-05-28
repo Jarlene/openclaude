@@ -9,6 +9,17 @@ import { PLAN_AGENT } from './built-in/planAgent.js'
 import { STATUSLINE_SETUP_AGENT } from './built-in/statuslineSetup.js'
 import { VERIFICATION_AGENT } from './built-in/verificationAgent.js'
 import type { AgentDefinition } from './loadAgentsDir.js'
+import { ARCHITECT_AGENT } from 'src/costrict/agents/architect.js'
+import { CODE_AGENT } from 'src/costrict/agents/code.js'
+import { REFLECTION_AGENT } from 'src/costrict/agents/reflection.js'
+import { REQUIREMENT_AGENT } from 'src/costrict/agents/requirement.js'
+import { RESEARCH_AGENT } from 'src/costrict/agents/research.js'
+import { REVIEW_AGENT } from 'src/costrict/agents/review.js'
+import { PLANNER_AGENT } from 'src/costrict/agents/planner.js'
+import { TEST_AGENT } from 'src/costrict/agents/tester.js'
+import { ORCHESTRATION_AGENT } from 'src/costrict/agents/orchestration.js'
+import { CRITIQUE_AGENT } from 'src/costrict/agents/critique.js'
+import { JUDGE_AGENT } from 'src/costrict/agents/judge.js'
 
 export function areExplorePlanAgentsEnabled(): boolean {
   if (feature('BUILTIN_EXPLORE_PLAN_AGENTS')) {
@@ -45,6 +56,17 @@ export function getBuiltInAgents(): AgentDefinition[] {
   const agents: AgentDefinition[] = [
     GENERAL_PURPOSE_AGENT,
     STATUSLINE_SETUP_AGENT,
+    ARCHITECT_AGENT,
+    CODE_AGENT,
+    REFLECTION_AGENT,
+    REQUIREMENT_AGENT,
+    RESEARCH_AGENT,
+    REVIEW_AGENT,
+    PLANNER_AGENT,
+    ORCHESTRATION_AGENT,
+    TEST_AGENT,
+    CRITIQUE_AGENT,
+    JUDGE_AGENT,
   ]
 
   if (areExplorePlanAgentsEnabled()) {
