@@ -118,7 +118,7 @@ Create detailed steps with:
 
 
 export const PLANNER_AGENT: BuiltInAgentDefinition = {
-  agentType: 'palnner',
+  agentType: 'planner',
   whenToUse: 'Expert planning specialist for complex features and refactoring. Use PROACTIVELY when users request feature implementation, architectural changes, or complex refactoring. Automatically activated for planning tasks.',
   disallowedTools: [EXIT_PLAN_MODE_TOOL_NAME],
   source: 'built-in',
