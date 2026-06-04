@@ -43,6 +43,7 @@ const featureFlags: Record<string, boolean> = {
   MONITOR_TOOL: true,                 // MCP server monitoring/streaming tool
   TEAMMEM: true,                      // Team memory management
   MESSAGE_ACTIONS: true,              // Message action buttons in the UI
+  WORKFLOW_SCRIPTS: true,             // Dynamic workflow tool for fan-out subagent orchestration
 
   // ── Enabled: new activations ────────────────────────────────────────
   DUMP_SYSTEM_PROMPT: true,           // --dump-system-prompt CLI flag for debugging
