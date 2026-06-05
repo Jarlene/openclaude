@@ -58,7 +58,7 @@ export interface AgentOptions {
   schema?: Record<string, unknown>
   model?: string
   isolation?: 'worktree'
-  agentType?: string
+  subagent_type?: string
 }
 
 interface RuntimeState {
@@ -515,7 +515,7 @@ function normalizeAgentOptions(value: unknown): AgentOptions {
     phase: optionalString(options.phase, 'agent phase'),
     model: optionalString(options.model, 'agent model'),
     isolation: options.isolation,
-    agentType: optionalString(options.agentType, 'agent type'),
+    subagent_type: optionalString(options.subagent_type, 'agent type'),
   }
 }
 
@@ -540,7 +540,7 @@ function buildAgentInstructions(
 ): string | undefined {
   const lines = []
   if (phase) lines.push(`Workflow phase: ${phase}`)
-  if (options.agentType) lines.push(`Act as workflow subagent type: ${options.agentType}`)
+  if (options.subagent_type) lines.push(`Act as workflow subagent type: ${options.subagent_type}`)
   if (options.isolation) lines.push(`Requested isolation: ${options.isolation}`)
   if (options.model) lines.push(`Requested model: ${options.model}`)
   return lines.length ? lines.join('\n') : undefined

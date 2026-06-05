@@ -103,7 +103,7 @@ export const WorkflowTool = buildTool({
       },
       args: {
         description:
-          'Optional JSON value exposed to the workflow script as global `args`.',
+          'Optional JSON value exposed to the workflow script as global `args`. args properties example:{\"label\":\"Optional label for the agent\", \"phase\":\"Optional phase identifier\",\"schema\":\"Optional schema definition as a Record\" ,\"model\":\"Optional model identifier\", \"subagent_type\":\"Optional type of the agent\", \"isolation\": \"Optional isolation mode, currently only \'worktree\' is supported\"}.',
       },
     },
     required: ['script'],
