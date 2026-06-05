@@ -60,7 +60,7 @@ export class WorkflowAgent {
       })
     }
 
-    const agentDefinition = this.resolveAgent(options.agentType)
+    const agentDefinition = this.resolveAgent(options.subagent_type)
     const availableTools = [...this.toolUseContext.options.tools, ...extraTools]
     const abortController = new AbortController()
     const abort = () => abortController.abort()
