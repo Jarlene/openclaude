@@ -16,6 +16,13 @@ import {
   renderWorkflowText,
   type WorkflowSnapshot,
 } from './display.js'
+import {
+  completeWorkflowTask,
+  failWorkflowTask,
+  registerWorkflowTask,
+  stopWorkflowTask,
+  updateWorkflowTaskSnapshot,
+} from '../../tasks/LocalWorkflowTask/LocalWorkflowTask.js'
 import { WORKFLOW_TOOL_NAME } from './constants.js'
 import {
   parseWorkflowScript,
@@ -51,14 +58,14 @@ export type Output = z.infer<OutputSchema>
 export const WORKFLOW_PROMPT_GUIDELINES = [
   'Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.',
   'For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.',
-  "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is optional metadata for a stable upfront outline.",
+  "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description', phases:[ list of phases] }`; meta.name and meta.description are required non-empty strings, and meta.phases is optional metadata for a stable upfront outline.",
   'For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().',
   'For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.',
   'For workflow, call phase(title) when a new group of work starts. Phase names may be conditional or built in a loop; do not predeclare speculative phases just in case.',
   'For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.',
-  "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
+  "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...', phase: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
   'For workflow, pipeline(items, ...stages) runs each item through stages sequentially, while different items may run concurrently. Each stage receives (previousValue, originalItem, index).',
-  "For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory' } or { label: 'source modules' }; unique labels make live status and error reporting readable.",
+  "For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory', phase: 'initialization' } or { label: 'source modules', phase: 'analysis' }; unique labels make live status and error reporting readable.",
   'For workflow, failed agent(), parallel(), or pipeline() branches return null and log the failure unless the workflow is aborted. Check for nulls before synthesizing conclusions.',
   'For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value with ok/verdict plus the important outputs.',
   'For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.',
@@ -103,7 +110,7 @@ export const WorkflowTool = buildTool({
       },
       args: {
         description:
-          'Optional JSON value exposed to the workflow script as global `args`. args properties example:{\"label\":\"Optional label for the agent\", \"phase\":\"Optional phase identifier\",\"schema\":\"Optional schema definition as a Record\" ,\"model\":\"Optional model identifier\", \"subagent_type\":\"Optional type of the agent\", \"isolation\": \"Optional isolation mode, currently only \'worktree\' is supported\"}.',
+          'Optional JSON value exposed to the workflow script as global `args`. args properties example:{\"label\":\"Optional label for the agent\", \"phase\":\"phase identifier\",\"schema\":\"Optional schema definition as a Record\" ,\"model\":\"Optional model identifier\", \"subagent_type\":\"Optional type of the agent\", \"isolation\": \"Optional isolation mode, currently only \'worktree\' is supported\"}.',
       },
     },
     required: ['script'],
@@ -134,10 +141,25 @@ export const WorkflowTool = buildTool({
     const script = normalizeWorkflowScript(input.script)
     const parsed = parseWorkflowScript(script)
     let snapshot: WorkflowSnapshot = createWorkflowSnapshot(parsed.meta)
+    const setTaskState =
+      toolUseContext.setAppStateForTasks ?? toolUseContext.setAppState
+    let progressCounter = 0
+    const workflowTask = registerWorkflowTask({
+      description: parsed.meta.description,
+      snapshot,
+      setAppState: setTaskState,
+      abortController: toolUseContext.abortController,
+      toolUseId: toolUseContext.toolUseId,
+    })
 
     const update = () => {
       snapshot = recomputeWorkflowSnapshot(snapshot)
-      onProgress?.({ data: { type: 'workflow_progress', snapshot } })
+      updateWorkflowTaskSnapshot(workflowTask.id, snapshot, setTaskState)
+      const progress: WorkflowProgress = { type: 'workflow_progress', snapshot }
+      onProgress?.({
+        toolUseID: `workflow-progress-${progressCounter++}`,
+        data: progress,
+      })
     }
 
     const recordPhase = (title: string | undefined) => {
@@ -195,8 +217,15 @@ export const WorkflowTool = buildTool({
             agent.error = 'aborted'
           }
         }
+        stopWorkflowTask(workflowTask.id, snapshot, setTaskState)
         throw new Error('Workflow was aborted')
       }
+      failWorkflowTask(
+        workflowTask.id,
+        snapshot,
+        error instanceof Error ? error.message : String(error),
+        setTaskState,
+      )
       throw error
     }
 
@@ -209,6 +238,7 @@ export const WorkflowTool = buildTool({
     snapshot.result = result.result
     snapshot.durationMs = result.durationMs
     snapshot = recomputeWorkflowSnapshot(snapshot)
+    completeWorkflowTask(workflowTask.id, snapshot, setTaskState)
 
     const content = `Workflow ${result.meta.name} completed with ${result.agentCount} agent(s).\n\nResult:\n${JSON.stringify(result.result, null, 2)}`
     return {
