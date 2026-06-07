@@ -73,27 +73,27 @@ export const WORKFLOW_PROMPT_GUIDELINES = [
   'For workflow, each agent() call should include the following options: { label: \'Optional label for the agent\', phase: \'phase identifier\', schema: \'Optional schema definition as a Record\', model: \'Optional model identifier\', subagent_type: \'Optional type of the agent\', isolation: \'Optional isolation mode, currently only \'worktree\' is supported\' }.',
 ]
 
-const WORKFLOW_PROMPT_SNIPPET =`Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{title:'phase title', detail:'Optional phase detail', model:'Optional phase model'}] }. Use phase(title) at runtime to create progress groups.
+const WORKFLOW_PROMPT_SNIPPET = `Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{title:'phase title', detail:'Optional phase detail', model:'Optional phase model'}] }. Use phase(title) at runtime to create progress groups.
 ## available agent_type
-- **architect**: Software architecture specialist for system design, scalability, and technical decision-making. Use PROACTIVELY when planning new features, refactoring large systems, or making architectural decisions.  
+- **architect**: Software architecture specialist for system design, scalability, and technical decision-making. Use PROACTIVELY when planning new features, refactoring large systems, or making architectural decisions.
   *Scenario: Designing a microservices migration strategy for a monolithic e-commerce platform handling 100K+ concurrent users.*
-- **code**: Implementation specialist for writing clean, efficient code.  
+- **code**: Implementation specialist for writing clean, efficient code.
   *Scenario: Implementing a thread-safe connection pool with proper resource cleanup and circuit breaker patterns.*
-- **planner**: Expert planning specialist for complex features and refactoring. Use PROACTIVELY when users request feature implementation, architectural changes, or complex refactoring. Automatically activated for planning tasks.  
+- **planner**: Expert planning specialist for complex features and refactoring. Use PROACTIVELY when users request feature implementation, architectural changes, or complex refactoring. Automatically activated for planning tasks.
   *Scenario: Breaking down a 3-month initiative to replace a legacy payment gateway with a modern event-driven architecture.*
-- **Reflection**: Self-Refinement and Iterative Improvement Framework. Reflect on previous response and output, based on Self-refinement framework for iterative improvement with complexity triage and verification.  
+- **Reflection**: Self-Refinement and Iterative Improvement Framework. Reflect on previous response and output, based on Self-refinement framework for iterative improvement with complexity triage and verification.
   *Scenario: Reviewing a generated code solution to identify edge cases, performance bottlenecks, and style inconsistencies before final delivery.*
-- **critique**: Expert critique specialist for comprehensive multi-perspective review using specialized judges with debate and consensus building.  
+- **critique**: Expert critique specialist for comprehensive multi-perspective review using specialized judges with debate and consensus building.
   *Scenario: Evaluating a proposed API design by simulating security, scalability, and DX (developer experience) reviewers to surface hidden trade-offs.*
-- **requirement**: Specification phase specialist for requirements analysis.  
+- **requirement**: Specification phase specialist for requirements analysis.
   *Scenario: Extracting unambiguous functional and non-functional requirements from stakeholder interviews for a real-time collaboration tool.*
-- **research**: Deep research and information gathering specialist.  
+- **research**: Deep research and information gathering specialist.
   *Scenario: Investigating state-of-the-art code database solutions and benchmarking their recall rates for a enterprise search system.*
-- **review**: Code review and quality assurance specialist.  
+- **review**: Code review and quality assurance specialist.
   *Scenario: Conducting a line-by-line review of a critical authentication module to ensure OWASP compliance and zero trust principles.*
-- **tester**: Comprehensive testing and quality assurance specialist.  
+- **tester**: Comprehensive testing and quality assurance specialist.
   *Scenario: Designing a test matrix covering unit, integration, chaos, and load testing for a distributed transaction processing service.*
-` 
+`
 
 const WORKFLOW_DESCRIPTION = [
   'Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline().',
