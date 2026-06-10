@@ -1949,8 +1949,88 @@ test('preserves image tool results as placeholders in follow-up requests', async
     text?: string
     image_url?: { url: string }
   }>
-  const imagePart = parts.find(part => part.type === 'image_url')
-  expect(imagePart?.image_url?.url).toBe('data:image/png;base64,ZmFrZQ==')
+  expect(parts).toEqual([
+    {
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,ZmFrZQ==' },
+    },
+  ])
+})
+
+test('adds text part for image-only user messages', async () => {
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'mimo-v2.5-pro',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'done',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 4,
+          total_tokens: 16,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  await client.beta.messages.create({
+    model: 'mimo-v2.5-pro',
+    system: 'test system',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/png',
+              data: 'ZmFrZQ==',
+            },
+          },
+        ],
+      },
+    ],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const userMessage = (requestBody?.messages as Array<Record<string, unknown>>).find(
+    message => message.role === 'user',
+  ) as {
+    content?: Array<{
+      type: string
+      text?: string
+      image_url?: { url: string }
+    }>
+  } | undefined
+
+  expect(userMessage?.content).toEqual([
+    { type: 'text', text: 'Image attached.' },
+    {
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,ZmFrZQ==' },
+    },
+  ])
 })
 
 test('preserves mixed text and image tool results as multipart content', async () => {
@@ -6373,4 +6453,132 @@ test('emits reasoning_effort from codex alias default when no override is passed
   })
 
   expect(requestBody?.reasoning_effort).toBe('high')
+})
+
+test('DeepSeek: redacted_thinking block preserves continuity with reasoning_content: ""', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.deepseek.com/v1'
+  process.env.OPENAI_API_KEY = 'sk-deepseek'
+
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'deepseek-chat',
+        choices: [
+          { message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+        ],
+        usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'deepseek-chat',
+    system: 'test',
+    messages: [
+      { role: 'user', content: 'analyze this' },
+      {
+        role: 'assistant',
+        content: [
+          // real redacted_thinking shape: content lives in `.data`, not `.thinking`
+          { type: 'redacted_thinking', data: '', signature: 'sig123' },
+          { type: 'text', text: 'Analysis complete.' },
+          {
+            type: 'tool_use',
+            id: 'call_redacted_1',
+            name: 'Bash',
+            input: { command: 'ls' },
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call_redacted_1', content: 'files' },
+        ],
+      },
+    ],
+    max_tokens: 32,
+    stream: false,
+  })
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>
+  const assistantWithToolCall = messages.find(
+    m => m.role === 'assistant' && Array.isArray(m.tool_calls),
+  )
+  expect(assistantWithToolCall).toBeDefined()
+  // redacted_thinking is recognized as a thinking block; its .data is "" and the
+  // message carries a tool_call, so it falls back to reasoning_content: ""
+  expect(assistantWithToolCall?.reasoning_content).toBe('')
+})
+
+test('DeepSeek: redacted_thinking block with non-empty data propagates data into reasoning_content', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.deepseek.com/v1'
+  process.env.OPENAI_API_KEY = 'sk-deepseek'
+
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-2',
+        model: 'deepseek-chat',
+        choices: [
+          { message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+        ],
+        usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'deepseek-chat',
+    system: 'test',
+    messages: [
+      { role: 'user', content: 'analyze this' },
+      {
+        role: 'assistant',
+        content: [
+          // real redacted_thinking with content in .data
+          {
+            type: 'redacted_thinking',
+            data: 'encrypted_chain_of_thought_payload_v1',
+            signature: 'sig456',
+          },
+          { type: 'text', text: 'Analysis complete.' },
+          {
+            type: 'tool_use',
+            id: 'call_redacted_2',
+            name: 'Bash',
+            input: { command: 'ls' },
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call_redacted_2', content: 'files' },
+        ],
+      },
+    ],
+    max_tokens: 32,
+    stream: false,
+  })
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>
+  const assistantWithToolCall = messages.find(
+    m => m.role === 'assistant' && Array.isArray(m.tool_calls),
+  )
+  expect(assistantWithToolCall).toBeDefined()
+  // The real .data payload must be preserved in reasoning_content — this is the
+  // case the original test missed (it used a synthetic .thinking field).
+  expect(assistantWithToolCall?.reasoning_content).toBe(
+    'encrypted_chain_of_thought_payload_v1',
+  )
 })

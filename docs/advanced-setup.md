@@ -194,7 +194,7 @@ export OPENAI_MODEL=gpt-5.4
 openclaude
 ```
 
-OpenCode Zen is a pay-as-you-go AI gateway with 41 models (GPT, Claude, Gemini,
+OpenCode Zen is a pay-as-you-go AI gateway with 43 models (GPT, Claude, Gemini,
 Qwen, MiniMax, GLM, Kimi, Grok, Big Pickle, DeepSeek, Nemotron). Uses the same
 `OPENCODE_API_KEY` as OpenCode Go. Get your key from https://opencode.ai.
 
@@ -209,7 +209,7 @@ export OPENAI_MODEL=glm-5.1
 openclaude
 ```
 
-OpenCode Go is a $10/mo subscription for 12 open models (GLM, Kimi, DeepSeek,
+OpenCode Go is a $10/mo subscription for 13 open models (GLM, Kimi, DeepSeek,
 MiMo, MiniMax, Qwen). Uses the same `OPENCODE_API_KEY` as OpenCode Zen.
 
 ### Gitlawb Opengateway
@@ -435,3 +435,26 @@ run `doctor:runtime` first and only launch the app if checks pass.
 For `dev:ollama`, make sure Ollama is running locally before launch.
 
 For `dev:atomic-chat`, make sure Atomic Chat is running with a model loaded before launch.
+
+## Message-Count Compaction Threshold
+
+By default, OpenClaude compacts conversations based on token usage. A secondary
+message-count-based trigger (`OPENCLAUDE_MAX_ACTIVE_MESSAGES`) exists for
+diagnostics but is disabled by default.
+
+If you frequently resume long sessions that accumulate hundreds of small
+tool-result messages with negligible token cost, you can opt in to message-count
+compaction via the in-app `/config` command:
+
+```text
+/config
+```
+
+Select **Message-count compaction** and choose a threshold (`100`, `200`, `500`,
+or `1000`). Setting it to `off` (default) disables the message-count trigger.
+
+This setting is intended for power users debugging specific edge cases. Most
+users should leave it at `off`.
+
+The legacy `OPENCLAUDE_MAX_ACTIVE_MESSAGES` environment variable is still
+honored when the setting is `off`.
