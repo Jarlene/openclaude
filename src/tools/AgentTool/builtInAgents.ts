@@ -10,6 +10,7 @@ import { STATUSLINE_SETUP_AGENT } from './built-in/statuslineSetup.js'
 import { VERIFICATION_AGENT } from './built-in/verificationAgent.js'
 import type { AgentDefinition } from './loadAgentsDir.js'
 import { ARCHITECT_AGENT } from 'src/costrict/agents/architect.js'
+import { METRICS_AGENT } from 'src/costrict/agents/metrics.js'
 import { CODE_AGENT } from 'src/costrict/agents/code.js'
 import { REFLECTION_AGENT } from 'src/costrict/agents/reflection.js'
 import { REQUIREMENT_AGENT } from 'src/costrict/agents/requirement.js'
@@ -62,6 +63,7 @@ export function getBuiltInAgents(): AgentDefinition[] {
     REQUIREMENT_AGENT,
     RESEARCH_AGENT,
     REVIEW_AGENT,
+    METRICS_AGENT,
     PLANNER_AGENT,
     ORCHESTRATION_AGENT,
     TEST_AGENT,
