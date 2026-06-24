@@ -38,10 +38,13 @@ const EXPECTED_PRESETS = [
   'xai',
   'venice',
   'xiaomi-mimo',
+  'xiaomi-mimo-token',
   'zai',
   'bankr',
   'atomic-chat',
   'gitlawb-opengateway',
+  'nearai',
+  'fireworks',
   'opencode',
   'opencode-go',
 ] as const satisfies readonly ProviderPreset[]

@@ -15,6 +15,8 @@ import {
   buildConversationChain,
   loadTranscriptFile,
   recordGoalState,
+  recordTranscript,
+  flushSessionStorage,
   resetProjectForTesting,
   resetSessionFilePointer,
   setSessionFileForTesting,
@@ -22,8 +24,16 @@ import {
   stripPersistedToolUseResultsFromJSONLBuffer,
 } from './sessionStorage.ts'
 import { createGoalState } from '../services/goal/state.js'
-import { getSessionId, switchSession } from '../bootstrap/state.js'
+import {
+  getSessionId,
+  isSessionPersistenceDisabled,
+  resetAllReplayIndexBuilders,
+  setSessionPersistenceDisabled,
+  switchSession,
+} from '../bootstrap/state.js'
 import type { GoalState } from '../services/goal/types.js'
+import { setClaudeConfigHomeDirForTesting } from './envUtils.js'
+import { resetSettingsCache } from './settings/settingsCache.js'
 
 const tempDirs: string[] = []
 const sessionId = '00000000-0000-4000-8000-000000000999'
@@ -164,8 +174,16 @@ function readGoalStateEntries(text: string): Array<{ goal: GoalState | null }> {
 
 async function withSessionPersistence<T>(fn: () => Promise<T>): Promise<T> {
   const originalPersistence = process.env.TEST_ENABLE_SESSION_PERSISTENCE
+  const originalSessionPersistence = process.env.ENABLE_SESSION_PERSISTENCE
+  const originalSkipPromptHistory = process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY
+  const originalNodeEnv = process.env.NODE_ENV
   const originalSessionId = getSessionId()
+  const originalSessionPersistenceDisabled = isSessionPersistenceDisabled()
+  process.env.NODE_ENV = 'development'
   process.env.TEST_ENABLE_SESSION_PERSISTENCE = 'true'
+  process.env.ENABLE_SESSION_PERSISTENCE = 'true'
+  delete process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY
+  setSessionPersistenceDisabled(false)
   try {
     resetProjectForTesting()
     return await fn()
@@ -175,6 +193,22 @@ async function withSessionPersistence<T>(fn: () => Promise<T>): Promise<T> {
     } else {
       process.env.TEST_ENABLE_SESSION_PERSISTENCE = originalPersistence
     }
+    if (originalSessionPersistence === undefined) {
+      delete process.env.ENABLE_SESSION_PERSISTENCE
+    } else {
+      process.env.ENABLE_SESSION_PERSISTENCE = originalSessionPersistence
+    }
+    if (originalSkipPromptHistory === undefined) {
+      delete process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY
+    } else {
+      process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY = originalSkipPromptHistory
+    }
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV
+    } else {
+      process.env.NODE_ENV = originalNodeEnv
+    }
+    setSessionPersistenceDisabled(originalSessionPersistenceDisabled)
     switchSession(originalSessionId)
     resetProjectForTesting()
   }
@@ -186,10 +220,51 @@ beforeEach(async () => {
 
 afterEach(async () => {
   try {
+    resetAllReplayIndexBuilders()
     await Promise.all(tempDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
   } finally {
     releaseSharedMutationLock()
   }
+})
+
+test('recordTranscript respects prompt-history opt-out for replay state', async () => {
+  await withSessionPersistence(async () => {
+    const configDir = await mkdtemp(
+      join(tmpdir(), 'openclaude-session-storage-config-'),
+    )
+    tempDirs.push(configDir)
+    setClaudeConfigHomeDirForTesting(configDir)
+    await writeFile(
+      join(configDir, 'settings.json'),
+      JSON.stringify({ cleanupPeriodDays: 30 }),
+      'utf-8',
+    )
+    resetSettingsCache()
+    process.env.TEST_ENABLE_SESSION_PERSISTENCE = 'false'
+    process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY = 'true'
+    resetProjectForTesting()
+    resetAllReplayIndexBuilders()
+
+    try {
+      await recordTranscript([
+        {
+          uuid: id(900),
+          type: 'user',
+          message: {
+            role: 'user',
+            content: 'do not retain this in replay state',
+          },
+          timestamp: ts,
+          isMeta: false,
+        } as never,
+      ])
+
+      expect(resetAllReplayIndexBuilders()).toEqual([])
+    } finally {
+      setClaudeConfigHomeDirForTesting(undefined)
+      resetSettingsCache()
+    }
+  })
 })
 
 test('loadTranscriptFile replays a persisted snip boundary, pruning and relinking', async () => {
@@ -547,6 +622,7 @@ test('recordGoalState writes goal metadata durably before resolving', async () =
       },
       sessionId as never,
     )
+    await flushSessionStorage()
 
     const text = await readFile(filePath, 'utf8')
     expect(text).toContain('"type":"goal-state"')
