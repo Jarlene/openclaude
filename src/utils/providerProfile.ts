@@ -25,6 +25,8 @@ import {
   getRouteDefaultBaseUrl,
   getRouteDefaultModel,
   normalizeXiaomiMimoBaseUrl,
+  resolveRouteCredentialValue,
+  resolveRouteIdFromBaseUrl,
 } from '../integrations/routeMetadata.js'
 import {
   maskSecretForDisplay,
@@ -101,12 +103,16 @@ const PROFILE_ENV_KEYS = [
   'BANKR_MODEL',
   'XAI_API_KEY',
   'XAI_CREDENTIAL_SOURCE',
+  'AIMLAPI_API_KEY',
   'VENICE_API_KEY',
   'MIMO_API_KEY',
   'ATLAS_CLOUD_API_KEY',
   'NEARAI_API_KEY',
   'FIREWORKS_API_KEY',
+  'CLINE_API_KEY',
   'OPENCODE_API_KEY',
+  'CLAUDE_CODE_PROVIDER_ROUTE_ID',
+  'CLOUDFLARE_API_TOKEN',
   DEFAULT_STARTUP_PROVIDER_ENV_VAR,
 ] as const
 
@@ -136,6 +142,7 @@ export type ProviderProfile =
   | 'vertex'
   | 'xai'
   | 'opencode'
+  | 'clinepass'
 
 export type ProfileEnv = {
   ANTHROPIC_BASE_URL?: string
@@ -178,13 +185,17 @@ export type ProfileEnv = {
   BANKR_MODEL?: string
   XAI_API_KEY?: string
   XAI_CREDENTIAL_SOURCE?: 'oauth'
+  AIMLAPI_API_KEY?: string
   VENICE_API_KEY?: string
   MIMO_API_KEY?: string
   ATLAS_CLOUD_API_KEY?: string
+  CLINE_API_KEY?: string
   NEARAI_API_KEY?: string
   FIREWORKS_API_KEY?: string
   OPENCODE_API_KEY?: string
+  CLOUDFLARE_API_TOKEN?: string
   CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS?: string
+  CLAUDE_CODE_PROVIDER_ROUTE_ID?: string
 }
 
 export type ProfileFile = {
@@ -846,12 +857,16 @@ export function buildOpenAIProfileEnv(options: {
     ) ||
     (useShellOpenAIConfig ? shellOpenAIModel : undefined) ||
     defaultModel
+  const resolvedBaseUrl =
+    sanitizeProviderConfigValue(options.baseUrl, secretSource) ||
+    (useShellOpenAIConfig ? shellOpenAIBaseUrl : undefined) ||
+    DEFAULT_OPENAI_BASE_URL
 
   return {
-    OPENAI_BASE_URL:
-      sanitizeProviderConfigValue(options.baseUrl, secretSource) ||
-      (useShellOpenAIConfig ? shellOpenAIBaseUrl : undefined) ||
-      DEFAULT_OPENAI_BASE_URL,
+    ...(resolveRouteIdFromBaseUrl(resolvedBaseUrl) === 'aimlapi' && key
+      ? { AIMLAPI_API_KEY: key }
+      : {}),
+    OPENAI_BASE_URL: resolvedBaseUrl,
     OPENAI_MODEL: normalizedModel,
     ...(options.apiFormat ? { OPENAI_API_FORMAT: options.apiFormat } : {}),
     ...(options.authHeader ? { OPENAI_AUTH_HEADER: options.authHeader } : {}),
@@ -1225,6 +1240,28 @@ export function hasExplicitProviderSelection(
   )
 }
 
+function hasExplicitNonOpenAIProviderSelection(
+  processEnv: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    isEnvTruthy(processEnv.CLAUDE_CODE_USE_GITHUB) ||
+    isEnvTruthy(processEnv.CLAUDE_CODE_USE_GEMINI) ||
+    isEnvTruthy(processEnv.CLAUDE_CODE_USE_MISTRAL) ||
+    isEnvTruthy(processEnv.CLAUDE_CODE_USE_BEDROCK) ||
+    isEnvTruthy(processEnv.CLAUDE_CODE_USE_VERTEX) ||
+    isEnvTruthy(processEnv.CLAUDE_CODE_USE_FOUNDRY)
+  )
+}
+
+function hasExplicitOpenAICompatibleOptOut(
+  processEnv: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    processEnv.CLAUDE_CODE_USE_OPENAI !== undefined &&
+    !isEnvTruthy(processEnv.CLAUDE_CODE_USE_OPENAI)
+  )
+}
+
 function hasConcreteProviderSelection(
   processEnv: NodeJS.ProcessEnv = process.env,
 ): boolean {
@@ -1286,6 +1323,38 @@ function hasConcreteProviderSelection(
     sanitizeApiKey(processEnv.FIREWORKS_API_KEY) !== undefined ||
     sanitizeApiKey(processEnv.NEARAI_API_KEY) !== undefined
   )
+}
+
+function getConcreteOpenAICompatibleEnvRouteId(
+  processEnv: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const openAIBaseUrl =
+    sanitizeProviderConfigValue(processEnv.OPENAI_BASE_URL) ??
+    sanitizeProviderConfigValue(processEnv.OPENAI_API_BASE)
+  const openAIModel = normalizeProfileModel(
+    sanitizeProviderConfigValue(processEnv.OPENAI_MODEL),
+  )
+  const openAICredential = resolveOpenAICredentialEnvSelection(processEnv)
+  const openAIRouteId = resolveRouteIdFromBaseUrl(openAIBaseUrl)
+  const routeCredential = sanitizeApiKey(
+    resolveRouteCredentialValue({
+      routeId: openAIRouteId ?? 'custom',
+      baseUrl: openAIBaseUrl,
+      processEnv,
+    }),
+  )
+  const authHeaderValue = sanitizeApiKey(processEnv.OPENAI_AUTH_HEADER_VALUE)
+  if (
+    openAIBaseUrl !== undefined &&
+    openAIModel !== undefined &&
+    (openAICredential?.kind === 'usable' ||
+      routeCredential !== undefined ||
+      authHeaderValue !== undefined)
+  ) {
+    return openAIRouteId ?? 'custom'
+  }
+
+  return null
 }
 
 export function selectAutoProfile(
@@ -1822,18 +1891,56 @@ export async function buildLaunchEnv(options: {
   // precedence — because dedicatedCredentialsOnly routes ignore
   // OPENAI_API_KEY, so dropping them would leave the relaunched profile
   // unauthenticated.
+  const resolvedOpenAIRouteId = resolveRouteIdFromBaseUrl(env.OPENAI_BASE_URL)
+  const persistedOpenAIRouteId = persistedEnv.CLAUDE_CODE_PROVIDER_ROUTE_ID?.trim()
+  const shouldUsePersistedOpenAIRouteId =
+    !resolvedOpenAIRouteId &&
+    !!persistedOpenAIRouteId &&
+    !!persistedOpenAIBaseUrl &&
+    env.OPENAI_BASE_URL === persistedOpenAIBaseUrl
+  const effectiveOpenAIRouteId =
+    resolvedOpenAIRouteId ||
+    (shouldUsePersistedOpenAIRouteId ? persistedOpenAIRouteId : undefined)
+  if (resolvedOpenAIRouteId && resolvedOpenAIRouteId !== 'openai') {
+    env.CLAUDE_CODE_PROVIDER_ROUTE_ID = resolvedOpenAIRouteId
+  } else if (shouldUsePersistedOpenAIRouteId && persistedOpenAIRouteId) {
+    env.CLAUDE_CODE_PROVIDER_ROUTE_ID = persistedOpenAIRouteId
+  } else {
+    delete env.CLAUDE_CODE_PROVIDER_ROUTE_ID
+  }
   for (const dedicatedKey of [
     'ATLAS_CLOUD_API_KEY',
     'NEARAI_API_KEY',
     'FIREWORKS_API_KEY',
+    'AIMLAPI_API_KEY',
     'MIMO_API_KEY',
+    'NVIDIA_API_KEY',
     'VENICE_API_KEY',
   ] as const) {
+    // AI/ML API accepts the generic OPENAI_API_KEY, so it does not need an
+    // unconditional carry-over. Only mirror AIMLAPI_API_KEY when the launch
+    // actually targets the aimlapi route — otherwise an ambient or persisted
+    // AI/ML key would leak into an unrelated OpenAI-compatible session.
+    if (dedicatedKey === 'AIMLAPI_API_KEY' && effectiveOpenAIRouteId !== 'aimlapi') {
+      continue
+    }
+    if (dedicatedKey === 'NVIDIA_API_KEY' && effectiveOpenAIRouteId !== 'nvidia-nim') {
+      continue
+    }
     const dedicatedValue =
+      (dedicatedKey === 'AIMLAPI_API_KEY' && openAICredential?.kind === 'usable'
+        ? sanitizeApiKey(openAICredential.value)
+        : undefined) ||
       sanitizeApiKey(processEnv[dedicatedKey]) ||
       sanitizeApiKey(persistedEnv[dedicatedKey])
     if (dedicatedValue) {
       env[dedicatedKey] = dedicatedValue
+    }
+  }
+  if (effectiveOpenAIRouteId === 'nvidia-nim') {
+    const nvidiaNimFlag = processEnv.NVIDIA_NIM || persistedEnv.NVIDIA_NIM
+    if (nvidiaNimFlag) {
+      env.NVIDIA_NIM = nvidiaNimFlag
     }
   }
   const customHeaders = shellCustomHeaders || persistedCustomHeaders
@@ -1886,6 +1993,23 @@ export async function buildStartupEnvFromProfile(options?: {
     return processEnv
   }
 
+  const concreteOpenAIRouteId = getConcreteOpenAICompatibleEnvRouteId(processEnv)
+  if (
+    concreteOpenAIRouteId === 'nvidia-nim' &&
+    !isEnvTruthy(processEnv.CLAUDE_CODE_USE_OPENAI) &&
+    !hasExplicitOpenAICompatibleOptOut(processEnv) &&
+    !hasExplicitNonOpenAIProviderSelection(processEnv)
+  ) {
+    return buildLaunchEnv({
+      profile: 'openai',
+      persisted: null,
+      goal:
+        options?.goal ??
+        normalizeRecommendationGoal(processEnv.OPENCLAUDE_PROFILE_GOAL),
+      processEnv,
+    })
+  }
+
   // If startup already has a concrete provider selection, keep trusting it.
   // This prevents legacy profiles or the fresh-install default from becoming
   // a silent third precedence layer over explicit env/flags.
@@ -1903,10 +2027,7 @@ export async function buildStartupEnvFromProfile(options?: {
     // injecting the default Opengateway profile — otherwise the fallback
     // re-enables OpenAI and the startup validator reports a spurious missing
     // OPENAI_API_KEY warning (#1245).
-    if (
-      processEnv.CLAUDE_CODE_USE_OPENAI !== undefined &&
-      !isEnvTruthy(processEnv.CLAUDE_CODE_USE_OPENAI)
-    ) {
+    if (hasExplicitOpenAICompatibleOptOut(processEnv)) {
       return processEnv
     }
 

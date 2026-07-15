@@ -15,12 +15,14 @@ import {
 const TEST_ENV_KEYS = [
   'NODE_OPTIONS',
   'AZURE_OPENAI_API_VERSION',
+  'CLAUDE_CODE_USE_OPENAI',
   'CODEX_AUTH_JSON_PATH',
   'CODEX_HOME',
   'OPENAI_API_KEYS',
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
   'OPENAI_MODEL',
+  'OPENCLAUDE_OLLAMA_NUM_CTX',
   'WEB_AUTH_HEADER',
   'WEB_AUTH_SCHEME',
   'WEB_BODY_TEMPLATE',
@@ -38,6 +40,7 @@ const TEST_ENV_KEYS = [
   'WEB_QUERY_PARAM',
   'WEB_SEARCH_API',
   'WEB_SEARCH_PROVIDER',
+  'WEB_SEARCH_TIMEOUT_SEC',
   'WEB_URL_TEMPLATE',
 ]
 
@@ -147,6 +150,30 @@ BAZ=qux
       FOO: '{"k":"v"}',
       BAZ: "it's ok",
     })
+  })
+
+  it('collapses escaped backslashes inside quoted values', () => {
+    // The value content is C:\\Users\\me — escaped backslashes that the
+    // closing-quote scanner already treats as single backslashes, so the
+    // unescaper must collapse them too.
+    const result = parseEnvFile('FOO="C:\\\\Users\\\\me"')
+    expect(result).toEqual({ FOO: 'C:\\Users\\me' })
+  })
+
+  it('keeps lone backslashes in quoted values intact', () => {
+    // A single backslash before an ordinary character is not an escape and
+    // must survive verbatim (e.g. a Windows path written without doubling).
+    const result = parseEnvFile('FOO="C:\\Users\\me"')
+    expect(result).toEqual({ FOO: 'C:\\Users\\me' })
+  })
+
+  it('collapses an escaped backslash adjacent to the closing quote', () => {
+    // The value content is a\\ — the escaped backslash sits right before the
+    // terminator, the trickiest interaction between findClosingQuote (which
+    // counts the even backslash run and keeps scanning) and unescapeQuotedValue
+    // (which must collapse the pair to one trailing backslash).
+    const result = parseEnvFile('FOO="a\\\\"')
+    expect(result).toEqual({ FOO: 'a\\' })
   })
 
   it('strips inline comments from unquoted values', () => {
@@ -259,6 +286,17 @@ describe('loadEnvFile', () => {
     })
   })
 
+  it('loads documented Ollama request context window values', () => {
+    const filePath = writeTempEnvFile('OPENCLAUDE_OLLAMA_NUM_CTX=32768')
+
+    const loaded = loadEnvFile(filePath)
+
+    expect(process.env.OPENCLAUDE_OLLAMA_NUM_CTX).toBe('32768')
+    expect(loaded).toEqual({
+      OPENCLAUDE_OLLAMA_NUM_CTX: '32768',
+    })
+  })
+
   it('loads documented custom web search and Codex auth-file setup values', () => {
     const filePath = writeTempEnvFile([
       'WEB_SEARCH_PROVIDER=custom',
@@ -274,6 +312,7 @@ describe('loadEnvFile', () => {
       'WEB_AUTH_SCHEME=',
       'WEB_HEADERS=Accept: application/json; X-Tenant: acme',
       'WEB_JSON_PATH=response.payload.results',
+      'WEB_SEARCH_TIMEOUT_SEC=30',
       'WEB_CUSTOM_TIMEOUT_SEC=15',
       'WEB_CUSTOM_MAX_BODY_KB=300',
       'WEB_CUSTOM_ALLOW_ARBITRARY_HEADERS=true',
@@ -299,6 +338,7 @@ describe('loadEnvFile', () => {
       WEB_AUTH_SCHEME: '',
       WEB_HEADERS: 'Accept: application/json; X-Tenant: acme',
       WEB_JSON_PATH: 'response.payload.results',
+      WEB_SEARCH_TIMEOUT_SEC: '30',
       WEB_CUSTOM_TIMEOUT_SEC: '15',
       WEB_CUSTOM_MAX_BODY_KB: '300',
       WEB_CUSTOM_ALLOW_ARBITRARY_HEADERS: 'true',
@@ -308,6 +348,7 @@ describe('loadEnvFile', () => {
       CODEX_HOME: '/tmp/codex',
     })
     expect(process.env.WEB_SEARCH_API).toBe('https://search.example.com/search')
+    expect(process.env.WEB_SEARCH_TIMEOUT_SEC).toBe('30')
     expect(process.env.CODEX_AUTH_JSON_PATH).toBe('/tmp/codex-auth.json')
   })
 

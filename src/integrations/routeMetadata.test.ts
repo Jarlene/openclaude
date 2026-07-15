@@ -6,10 +6,66 @@ import {
   getRouteDefaultBaseUrl,
   getRouteDefaultModel,
   getRouteProviderTypeLabel,
+  isCloudflareBaseUrl,
   resolveActiveRouteIdFromEnv,
   resolveRouteCredentialValue,
   resolveRouteIdFromBaseUrl,
 } from './routeMetadata.js'
+
+test('isCloudflareBaseUrl matches Workers AI host but not the shared AI Gateway', () => {
+  // Workers AI lives on api.cloudflare.com.
+  expect(
+    isCloudflareBaseUrl(
+      'https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1',
+    ),
+  ).toBe(true)
+  // The shared AI Gateway host proxies arbitrary providers (OpenAI, Anthropic),
+  // so a profile pointed there must NOT be treated as Cloudflare-credentialed.
+  expect(
+    isCloudflareBaseUrl(
+      'https://gateway.ai.cloudflare.com/v1/acct/gw/openai',
+    ),
+  ).toBe(false)
+  expect(
+    isCloudflareBaseUrl(
+      'https://gateway.ai.cloudflare.com/v1/acct/gw/anthropic',
+    ),
+  ).toBe(false)
+  // Lookalike host must not match.
+  expect(isCloudflareBaseUrl('https://api.cloudflare.com.evil.test/v1')).toBe(
+    false,
+  )
+  expect(isCloudflareBaseUrl(undefined)).toBe(false)
+  // Same host, but a general Cloudflare REST path — NOT Workers AI. Must not
+  // match, or it would inherit Workers-AI routing + CLOUDFLARE_API_TOKEN
+  // mirroring for an unrelated Cloudflare API call.
+  expect(
+    isCloudflareBaseUrl(
+      'https://api.cloudflare.com/client/v4/user/tokens/verify',
+    ),
+  ).toBe(false)
+  expect(isCloudflareBaseUrl('https://api.cloudflare.com/')).toBe(false)
+  // The descriptor's unresolved <ACCOUNT_ID> placeholder is not a real endpoint.
+  expect(
+    isCloudflareBaseUrl(
+      'https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1',
+    ),
+  ).toBe(false)
+  // A resolved account id with the OpenAI-compatible suffix still matches.
+  expect(
+    isCloudflareBaseUrl(
+      'https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1/chat/completions',
+    ),
+  ).toBe(true)
+  // Workers AI is HTTPS-only. A plaintext http:// endpoint on the same host and
+  // path must NOT match, or the Cloudflare route would mirror
+  // CLOUDFLARE_API_TOKEN into OPENAI_API_KEY over cleartext.
+  expect(
+    isCloudflareBaseUrl(
+      'http://api.cloudflare.com/client/v4/accounts/abc123/ai/v1',
+    ),
+  ).toBe(false)
+})
 
 test('getRouteProviderTypeLabel uses descriptor transport kinds for provider labels', () => {
   expect(getRouteProviderTypeLabel('anthropic')).toBe('Anthropic native API')
@@ -49,6 +105,11 @@ test('getRouteCredentialEnvVars keeps descriptor env vars and openai fallback fo
   ])
   expect(getRouteCredentialEnvVars('hicap')).toEqual([
     'HICAP_API_KEY',
+    'OPENAI_API_KEYS',
+    'OPENAI_API_KEY',
+  ])
+  expect(getRouteCredentialEnvVars('aimlapi')).toEqual([
+    'AIMLAPI_API_KEY',
     'OPENAI_API_KEYS',
     'OPENAI_API_KEY',
   ])
@@ -156,6 +217,96 @@ test('Venice route metadata uses official OpenAI-compatible defaults', () => {
   expect(resolveRouteIdFromBaseUrl('https://api.venice.ai/api/v1/chat/completions')).toBe('venice')
 })
 
+test('AI/ML API route metadata uses official OpenAI-compatible defaults', () => {
+  expect(getRouteDefaultBaseUrl('aimlapi')).toBe('https://api.aimlapi.com/v1')
+  expect(getRouteDefaultModel('aimlapi')).toBe('gpt-4o')
+  expect(resolveRouteIdFromBaseUrl('https://api.aimlapi.com/v1')).toBe('aimlapi')
+  expect(resolveRouteIdFromBaseUrl('https://api.aimlapi.com/v1/chat/completions')).toBe('aimlapi')
+})
+
+test('AI/ML API route credential discovery ignores placeholder dedicated key', () => {
+  expect(
+    resolveRouteCredentialValue({
+      routeId: 'aimlapi',
+      processEnv: {
+        AIMLAPI_API_KEY: 'SUA_CHAVE',
+        OPENAI_API_KEY: 'sk-openai-fallback',
+      },
+    }),
+  ).toBe('sk-openai-fallback')
+})
+
+test('Cloudflare Workers AI route only matches api.cloudflare.com, not the shared AI Gateway host (#1100)', () => {
+  // api.cloudflare.com is the Workers AI host — direct match is fine.
+  expect(
+    resolveRouteIdFromBaseUrl(
+      'https://api.cloudflare.com/client/v4/accounts/acc-123/ai/v1',
+    ),
+  ).toBe('cloudflare')
+  // gateway.ai.cloudflare.com is the shared host for all AI Gateway routes
+  // (Workers AI, Anthropic, OpenAI, etc.). Matching here would apply
+  // Workers-AI runtime metadata + credential precedence to other providers'
+  // Gateway URLs, so the route MUST NOT claim it. Falls back to custom/
+  // OpenAI-compatible (null) per resolveRouteIdFromBaseUrl semantics.
+  expect(
+    resolveRouteIdFromBaseUrl(
+      'https://gateway.ai.cloudflare.com/v1/acc-123/my-gw/anthropic',
+    ),
+  ).toBe(null)
+  expect(
+    resolveRouteIdFromBaseUrl(
+      'https://gateway.ai.cloudflare.com/v1/acc-123/my-gw/openai',
+    ),
+  ).toBe(null)
+  // Same-host general REST path is not the Workers AI route.
+  expect(
+    resolveRouteIdFromBaseUrl(
+      'https://api.cloudflare.com/client/v4/user/tokens/verify',
+    ),
+  ).toBe(null)
+})
+
+test('resolveActiveRouteIdFromEnv does not claim cloudflare for a retargeted cloudflare profile (#1100)', () => {
+  // A saved `cloudflare` profile pointed at a non-Workers URL must fall back to
+  // generic openai/custom, not resolve as cloudflare via the profile-provider
+  // shortcut — otherwise the Workers AI shim config + CLOUDFLARE_API_TOKEN
+  // mirroring would be applied to the shared AI Gateway host or a general REST
+  // path.
+  // Falls back to the generic OpenAI-compatible `custom` route (not just
+  // "anything but cloudflare"), so the assertion also pins the intended target.
+  const gatewayUrl = 'https://gateway.ai.cloudflare.com/v1/abc/gw/openai'
+  expect(
+    resolveActiveRouteIdFromEnv(
+      { CLAUDE_CODE_USE_OPENAI: '1', OPENAI_BASE_URL: gatewayUrl },
+      { activeProfileProvider: 'cloudflare', activeProfileBaseUrl: gatewayUrl },
+    ),
+  ).toBe('custom')
+
+  const restUrl = 'https://api.cloudflare.com/client/v4/user/tokens/verify'
+  expect(
+    resolveActiveRouteIdFromEnv(
+      { CLAUDE_CODE_USE_OPENAI: '1', OPENAI_BASE_URL: restUrl },
+      { activeProfileProvider: 'cloudflare', activeProfileBaseUrl: restUrl },
+    ),
+  ).toBe('custom')
+})
+
+test('resolveActiveRouteIdFromEnv still resolves cloudflare for a real Workers AI profile (#1100)', () => {
+  // With the env base URL unset, the profile-provider fallback runs; a genuine
+  // Workers AI profile base URL must still resolve as cloudflare.
+  const workersUrl =
+    'https://api.cloudflare.com/client/v4/accounts/real123/ai/v1'
+  expect(
+    resolveActiveRouteIdFromEnv(
+      { CLAUDE_CODE_USE_OPENAI: '1' },
+      {
+        activeProfileProvider: 'cloudflare',
+        activeProfileBaseUrl: workersUrl,
+      },
+    ),
+  ).toBe('cloudflare')
+})
+
 test('Xiaomi MiMo route metadata uses official OpenAI-compatible defaults', () => {
   expect(getRouteDefaultBaseUrl('xiaomi-mimo')).toBe('https://api.xiaomimimo.com/v1')
   expect(getRouteDefaultModel('xiaomi-mimo')).toBe('mimo-v2.5-pro')
@@ -198,12 +349,93 @@ test('resolveActiveRouteIdFromEnv treats Venice credential-only env as Venice', 
   ).toBe('venice')
 })
 
+test('resolveActiveRouteIdFromEnv treats AI/ML API credential-only env as AI/ML API', () => {
+  expect(
+    resolveActiveRouteIdFromEnv({
+      AIMLAPI_API_KEY: 'aimlapi-key',
+    }),
+  ).toBe('aimlapi')
+})
+
+test('resolveActiveRouteIdFromEnv prefers dedicated AI/ML API key over ambient OpenAI keys', () => {
+  expect(
+    resolveActiveRouteIdFromEnv({
+      AIMLAPI_API_KEY: 'aimlapi-key',
+      OPENAI_API_KEY: 'ambient-openai-key',
+      OPENAI_API_KEYS: 'ambient-openai-key-a,ambient-openai-key-b',
+    }),
+  ).toBe('aimlapi')
+})
+
+test('resolveActiveRouteIdFromEnv prefers dedicated AI/ML API key over ambient compatible-provider keys', () => {
+  expect(
+    resolveActiveRouteIdFromEnv({
+      AIMLAPI_API_KEY: 'aimlapi-key',
+      XAI_API_KEY: 'ambient-xai-key',
+      MINIMAX_API_KEY: 'ambient-minimax-key',
+    }),
+  ).toBe('aimlapi')
+})
+
+test('resolveActiveRouteIdFromEnv keeps explicit OpenAI mode compatible with AI/ML API key-only setup', () => {
+  expect(
+    resolveActiveRouteIdFromEnv({
+      AIMLAPI_API_KEY: 'aimlapi-key',
+      CLAUDE_CODE_USE_OPENAI: '1',
+    }),
+  ).toBe('aimlapi')
+})
+
+test('resolveActiveRouteIdFromEnv does not infer AI/ML API with a conflicting OpenAI base URL', () => {
+  expect(
+    resolveActiveRouteIdFromEnv({
+      AIMLAPI_API_KEY: 'aimlapi-key',
+      OPENAI_API_KEY: 'ambient-openai-key',
+      OPENAI_BASE_URL: 'https://api.openai.com/v1',
+    }),
+  ).toBe('anthropic')
+})
+
+test('resolveActiveRouteIdFromEnv keeps an explicit non-OpenAI provider over AI/ML API key-only setup', () => {
+  expect(
+    resolveActiveRouteIdFromEnv({
+      AIMLAPI_API_KEY: 'aimlapi-key',
+      CLAUDE_CODE_USE_GEMINI: '1',
+    }),
+  ).toBe('gemini')
+})
+
+test('resolveActiveRouteIdFromEnv ignores placeholder AI/ML API credential-only env', () => {
+  expect(
+    resolveActiveRouteIdFromEnv({
+      AIMLAPI_API_KEY: 'SUA_CHAVE',
+    }),
+  ).toBe('anthropic')
+})
+
 test('resolveActiveRouteIdFromEnv treats xAI credential-only env as xAI', () => {
   expect(
     resolveActiveRouteIdFromEnv({
       XAI_API_KEY: 'xai-key',
     }),
   ).toBe('xai')
+})
+
+test('resolveActiveRouteIdFromEnv treats ClinePass credential-only env as ClinePass', () => {
+  expect(
+    resolveActiveRouteIdFromEnv({
+      CLINE_API_KEY: 'cline-key',
+    }),
+  ).toBe('clinepass')
+})
+
+test('resolveActiveRouteIdFromEnv prefers ClinePass key over Fireworks env-only intent', () => {
+  expect(
+    resolveActiveRouteIdFromEnv({
+      CLINE_API_KEY: 'cline-key',
+      FIREWORKS_API_KEY: 'fw-key',
+    }),
+  ).toBe('clinepass')
 })
 
 test('resolveActiveRouteIdFromEnv prefers xAI when env-only keys compete', () => {
@@ -265,7 +497,8 @@ test.each([
   ['NVIDIA NIM', 'https://integrate.api.nvidia.com/v1', 'nvidia/llama-3.1-nemotron-70b-instruct', 'nvidia-nim'],
   ['OpenRouter', 'https://openrouter.ai/api/v1', 'openai/gpt-5-mini', 'openrouter'],
   ['DeepSeek', 'https://api.deepseek.com/v1', 'deepseek-v4-pro', 'deepseek'],
-  ['Hicap', 'https://api.hicap.ai/v1', 'claude-opus-4.7', 'hicap'],
+  ['Hicap', 'https://api.hicap.ai/v1', 'claude-opus-4.8', 'hicap'],
+  ['AI/ML API', 'https://api.aimlapi.com/v1', 'gpt-4o', 'aimlapi'],
   ['Xiaomi MiMo', 'https://api.xiaomimimo.com/v1', 'mimo-v2.5-pro', 'xiaomi-mimo'],
   ['Venice', 'https://api.venice.ai/api/v1', 'venice-uncensored', 'venice'],
 ])(
@@ -284,6 +517,102 @@ test.each([
     ).toBe(expectedRouteId)
   },
 )
+
+test('resolveActiveRouteIdFromEnv refines generic OpenAI profile by ClinePass base URL', () => {
+  expect(
+    resolveActiveRouteIdFromEnv(
+      {
+        CLAUDE_CODE_USE_OPENAI: '1',
+        OPENAI_BASE_URL: 'https://api.cline.bot/api/v1',
+        OPENAI_MODEL: 'cline-pass/deepseek-v4-flash',
+      },
+      { activeProfileProvider: 'openai' },
+    ),
+  ).toBe('clinepass')
+})
+
+test('resolveActiveRouteIdFromEnv resolves ClinePass profile provider without env applied flag', () => {
+  expect(
+    resolveActiveRouteIdFromEnv(
+      {},
+      { activeProfileProvider: 'clinepass' },
+    ),
+  ).toBe('clinepass')
+})
+
+test('resolveActiveRouteIdFromEnv resolves ClinePass profile provider without CLAUDE_CODE_USE_OPENAI', () => {
+  expect(
+    resolveActiveRouteIdFromEnv(
+      {
+        CLINE_API_KEY: 'cp-key',
+      },
+      { activeProfileProvider: 'clinepass' },
+    ),
+  ).toBe('clinepass')
+})
+
+test('resolveActiveRouteIdFromEnv still returns anthropic when no env flags and no profile provider', () => {
+  expect(resolveActiveRouteIdFromEnv({})).toBe('anthropic')
+})
+
+test('resolveActiveRouteIdFromEnv resolves Atlas Cloud profile provider without env applied flag', () => {
+  expect(
+    resolveActiveRouteIdFromEnv(
+      {},
+      { activeProfileProvider: 'atlas-cloud' },
+    ),
+  ).toBe('atlas-cloud')
+})
+
+test('resolveActiveRouteIdFromEnv does not resolve custom profile provider as a known route', () => {
+  expect(
+    resolveActiveRouteIdFromEnv(
+      {},
+      { activeProfileProvider: 'custom' },
+    ),
+  ).toBe('anthropic')
+})
+
+test('resolveActiveRouteIdFromEnv resolves custom profile provider via ClinePass base URL', () => {
+  expect(
+    resolveActiveRouteIdFromEnv(
+      {},
+      {
+        activeProfileProvider: 'custom',
+        activeProfileBaseUrl: 'https://api.cline.bot/api/v1',
+      },
+    ),
+  ).toBe('clinepass')
+})
+
+test('resolveActiveRouteIdFromEnv resolves openai profile provider via ClinePass base URL', () => {
+  expect(
+    resolveActiveRouteIdFromEnv(
+      {
+        CLAUDE_CODE_USE_OPENAI: '1',
+      },
+      {
+        activeProfileProvider: 'openai',
+        activeProfileBaseUrl: 'https://api.cline.bot/api/v1',
+      },
+    ),
+  ).toBe('clinepass')
+})
+
+test('resolveActiveRouteIdFromEnv lets explicit OPENAI_BASE_URL override saved ClinePass profile', () => {
+  expect(
+    resolveActiveRouteIdFromEnv(
+      {
+        CLAUDE_CODE_USE_OPENAI: '1',
+        OPENAI_BASE_URL: 'https://openrouter.ai/api/v1',
+      },
+      {
+        activeProfileProvider: 'clinepass',
+        activeProfileBaseUrl: 'https://api.cline.bot/api/v1',
+      },
+    ),
+  ).toBe('openrouter')
+})
 
 test('resolveActiveRouteIdFromEnv does not infer MiniMax with OpenAI credentials', () => {
   expect(

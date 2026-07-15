@@ -98,10 +98,22 @@ third-party gateways.
 
 Authentication uses Google Application Default Credentials through
 `google-auth-library`. There is no `OPENAI_API_KEY`-style API key for this
-route. Authenticate with either a service-account file or local ADC:
+route. **For global npm installs, install the auth package on demand** (it is
+not bundled by default — see [Optional provider packages](#optional-provider-packages)):
 
 ```bash
+npm i -g google-auth-library
+```
+
+Authenticate with either local Application Default Credentials (ADC) or a
+service-account key file:
+
+```bash
+# Option 1 — local ADC (interactive, uses your own Google account):
 gcloud auth application-default login
+
+# Option 2 — service-account key file (headless / CI):
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 ```
 
 Minimal setup:
@@ -139,6 +151,53 @@ export CLAUDE_CODE_USE_OPENAI=1
 export OPENAI_BASE_URL=http://localhost:11434/v1
 export OPENAI_MODEL=llama3.3:70b
 ```
+
+#### Ollama Context Length
+
+OpenClaude sends the current conversation history to Ollama on each turn and
+uses Ollama's native chat API for Ollama endpoints. Native chat lets OpenClaude
+send `options.num_ctx` with each request, so Ollama receives a 32768-token
+context window by default instead of falling back to the smaller context often
+used by Ollama's OpenAI-compatible `/v1/chat/completions` shim.
+
+To choose a different request-level context size, set
+`OPENCLAUDE_OLLAMA_NUM_CTX` before launching OpenClaude:
+
+```bash
+export OPENCLAUDE_OLLAMA_NUM_CTX=65536
+```
+
+You can also start Ollama with a global context length:
+
+macOS / Linux:
+
+```bash
+# Stop any existing Ollama app/server first, then run:
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve
+```
+
+Windows PowerShell:
+
+```powershell
+# Quit any existing Ollama app/server first, then run:
+$env:OLLAMA_CONTEXT_LENGTH="32768"
+ollama serve
+```
+
+After a chat request, verify the loaded model is using the requested context:
+
+```bash
+ollama ps
+```
+
+Check the `CONTEXT` column. If it still shows a small value such as `4K` after a
+new OpenClaude request, stop the existing Ollama app/server, start it again, and
+retry the request.
+
+Use a concrete recall test after changing the setting, such as asking the model
+to repeat the first topic from the current chat. Questions like "do you remember our
+conversation?" can trigger generic local-model disclaimers even when history is
+present.
 
 ### Atomic Chat (local, Apple Silicon)
 
@@ -267,6 +326,17 @@ For direct TEE completions (lower latency, verifiable privacy):
 export OPENAI_BASE_URL=https://qwen35-122b.completions.near.ai/v1
 ```
 
+### Cloudflare Workers AI
+
+```bash
+export CLAUDE_CODE_USE_OPENAI=1
+export CLOUDFLARE_API_TOKEN=...
+export OPENAI_BASE_URL=https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1
+export OPENAI_MODEL=@cf/meta/llama-3.3-70b-instruct-fp8-fast
+```
+
+Replace `<ACCOUNT_ID>` with your Cloudflare account id (visible in the Cloudflare dashboard URL). `OPENAI_API_KEY` also works as a compatibility fallback, but `CLOUDFLARE_API_TOKEN` keeps the profile tied to the Cloudflare preset. The `/provider` Cloudflare Workers AI preset stores the token under `CLOUDFLARE_API_TOKEN`.
+
 ### Mistral
 
 ```bash
@@ -319,6 +389,24 @@ export OPENAI_MODEL=accounts/fireworks/models/llama-v3p1-70b-instruct
 
 The **OpenClaude VS Code extension** can store the key in Secret Storage and set these variables for you when you launch from the Control Center. See `vscode-extension/openclaude-vscode/README.md`.
 
+## Optional provider packages
+
+To keep the default `npm i -g @gitlawb/openclaude` install small and
+warning-free, a few provider SDKs and the native image library are **not
+bundled**. They are loaded on demand, and the CLI prints an `npm install <pkg>`
+hint (add `-g` for the global CLI) if you enable a feature whose package is
+missing. Install only what you need:
+
+| Feature | Trigger | Install |
+| --- | --- | --- |
+| AWS Bedrock | `CLAUDE_CODE_USE_BEDROCK=1` | `npm i -g @anthropic-ai/bedrock-sdk`. Profile-based auth (`~/.aws/credentials`) additionally needs `@aws-sdk/credential-providers` and `@aws-sdk/client-sts`; model listing needs `@aws-sdk/client-bedrock`. Proxy and skip-auth setups may also need `@aws-sdk/credential-provider-node`, `@smithy/node-http-handler`, or `@smithy/core`. The CLI prints the exact missing package if you hit one. |
+| Azure Foundry | `CLAUDE_CODE_USE_FOUNDRY=1` | `npm i -g @anthropic-ai/foundry-sdk @azure/identity` |
+| Claude on Vertex AI / Gemini ADC | `CLAUDE_CODE_USE_VERTEX=1` / Gemini ADC auth | `npm i -g google-auth-library` |
+| Reading/processing images | reading an image file | `npm i -g sharp` |
+
+When installing OpenClaude from source (`bun install`), all of these are
+already present as dev dependencies, so source/dev builds need no extra steps.
+
 ## Environment Variables
 
 | Variable | Required | Description |
@@ -329,7 +417,9 @@ The **OpenClaude VS Code extension** can store the key in Secret Storage and set
 | `OPENAI_MODEL` | OpenAI-compatible only | Model name such as `gpt-4o`, `deepseek-v4-flash`, or `llama3.3:70b` |
 | `OPENAI_BASE_URL` | No | API endpoint, defaulting to `https://api.openai.com/v1` |
 | `OPENAI_API_BASE` | No | Compatibility alias for `OPENAI_BASE_URL` |
+| `OPENCLAUDE_OLLAMA_NUM_CTX` | Ollama only | Request-level Ollama context window. Defaults to `32768`; set a larger value for longer same-session history if your model and hardware can handle it. |
 | `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` | No | JSON map of OpenAI-compatible model names to context windows, such as `{"custom-model":1000000}`. Use this when a custom provider does not expose context metadata from `/v1/models`. |
+| `CLAUDE_CODE_OPENAI_MAX_OUTPUT_TOKENS` | No | JSON map of OpenAI-compatible model names to max output tokens, such as `{"custom-model":32768}`. Use this when a custom provider does not expose output-limit metadata from `/v1/models`. |
 | `OPENCODE_API_KEY` | OpenCode Zen / Go | Shared API key for OpenCode Zen (pay-as-you-go) and OpenCode Go (subscription); get yours from https://opencode.ai |
 | `MIMO_API_KEY` | Xiaomi MiMo route | Xiaomi MiMo API key for `https://api.xiaomimimo.com/v1`; mirrored into the OpenAI-compatible auth env when the MiMo route is active |
 | `CLAUDE_CODE_USE_GEMINI` | Gemini only | Set to `1` to enable the direct Gemini provider path |
@@ -346,6 +436,7 @@ The **OpenClaude VS Code extension** can store the key in Secret Storage and set
 | `CODEX_HOME` | Codex only | Alternative Codex home directory |
 | `OPENCLAUDE_MAX_RETRIES` | No | Maximum retry attempts for retryable API failures, capped at 100 (default: 10). Set to `0` to disable retries after the initial request. If unset, deprecated `CLAUDE_CODE_MAX_RETRIES` is still honored for compatibility. |
 | `OPENCLAUDE_RETRY_DELAY_MS` | No | Base retry delay in milliseconds for APIs that do not send `Retry-After`; exponential backoff starts from this value, capped at 60000 (default: 500) |
+| `OPENCLAUDE_QUERY_HARD_MAX_MS` | No | Foreground query hard maximum in milliseconds. Defaults to 1800000 (30 minutes). Use a larger positive integer for long autonomous sessions; invalid, zero, negative, fractional, or timer-overflow values are ignored with a warning. |
 | `OPENCLAUDE_DISABLE_CO_AUTHORED_BY` | No | Suppress the default `Co-Authored-By` trailer in generated git commits |
 | `OPENCLAUDE_LOG_TOKEN_USAGE` | No | When truthy (e.g. `verbose`), emits one JSON line on stderr per API request with input/output/cache tokens and the resolved provider. **User-facing debug output** — complements the REPL display controlled by `/config showCacheStats`. Distinct from `CLAUDE_CODE_ENABLE_TOKEN_USAGE_ATTACHMENT`, which is **model-facing** (injects context usage info into the prompt itself). Both can run together. |
 
@@ -353,6 +444,65 @@ Model env vars are provider-scoped: first-party Anthropic sessions read
 `ANTHROPIC_MODEL`, OpenAI-compatible sessions read `OPENAI_MODEL`, Gemini reads
 `GEMINI_MODEL`, and Mistral reads `MISTRAL_MODEL`. For manual Bedrock, Vertex,
 or Foundry launches, select the model with `--model`.
+
+### Per-model limit overrides (`settings.json`)
+
+When a custom OpenAI-compatible provider does not expose context metadata from
+`/v1/models`, you can pin a model's context window and max output tokens. In
+addition to the `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` /
+`CLAUDE_CODE_OPENAI_MAX_OUTPUT_TOKENS` env vars above, you can set a
+`modelLimits` map in your `settings.json` (the same file `/config` writes, e.g.
+`~/.openclaude/settings.json`):
+
+```json
+{
+  "modelLimits": {
+    "my-custom-deployment": { "contextWindow": 262144, "maxOutputTokens": 32768 },
+    "api.private-llm.test:my-custom-deployment": { "contextWindow": 1000000 }
+  }
+}
+```
+
+- **Key matching** — keys match the model api-name exactly, or by prefix (e.g.
+  `my-custom` matches `my-custom-deployment-v2`). An **exact** key always wins
+  over a **prefix** key. A host-qualified key (`<host>:<model>`) only wins over a
+  bare key **within the same match kind** — a host-qualified exact key beats a
+  bare exact key, and a host-qualified prefix beats a bare prefix, but a bare
+  exact key still beats a host-qualified prefix. So to give the same model
+  different limits per endpoint, use host-qualified **exact** keys for each
+  endpoint. `<host>` is the `OPENAI_BASE_URL` host **including the port when the
+  URL has one** (`new URL(baseUrl).host`): for `http://localhost:4000/v1` the
+  key is `localhost:4000:my-model`, not `localhost:my-model`. Either field may be
+  omitted to override only one limit.
+- **Precedence** — from highest to lowest: an **exact** env-var override → the
+  built-in catalog value → the discovery-cache value → a **prefix** env-var
+  override → `modelLimits` → the descriptor default. (The built-in catalog is
+  checked before the discovery cache.) So env-var overrides always win over
+  `modelLimits`, and `modelLimits` mainly fills in models that have no built-in
+  metadata (a known catalog model keeps its catalog limit unless you set an
+  *exact* env override for it).
+
+## Safety strictness
+
+OpenClaude runs several "safety" checks: a model-level refusal directive, bash
+command-injection validation, and sensitive-file / auto-edit guards. These are
+conservative by design, but a few of them can surface as refusals or approval
+prompts for entirely benign, routine coding tasks (e.g. editing `.gitmodules`,
+running a build script that contains `$(date)`, or writing a CTF port scanner).
+See [issue #1616](https://github.com/Gitlawb/openclaude/issues/1616).
+
+Set `OPENCLAUDE_SAFETY_LEVEL` to dial strictness without changing behavior for
+everyone:
+
+| Value | Behavior |
+|-------|----------|
+| `strict` | Current/default-equivalent non-permissive behavior. |
+| `balanced` | Default. Same behavior as `strict`. |
+| `permissive` | Opt-in mode for users who prefer fewer false-positive stops. It bypasses the legacy bash command-injection validation path entirely, keeps ordinary interpreter allow-rules (`Bash(python:*)`, `Bash(npm run:*)`, …) when entering auto mode, and skips prompts for routine edits to filenames on the broad sensitive-file list. Dangerous directory, Windows-path, symlink-resolved path, and UNC guards remain active. The model-level prompt is not weakened by this flag. |
+
+```bash
+export OPENCLAUDE_SAFETY_LEVEL=permissive   # relax benign-task false positives
+```
 
 ## Runtime Hardening
 
@@ -377,6 +527,12 @@ openclaude doctor report --markdown
 # write a redacted JSON issue report for attachment
 openclaude doctor report --json --out openclaude-report.json
 
+# write a deterministic task report from a session transcript
+openclaude report --json --transcript ~/.openclaude/projects/-path-to-project/session-id.jsonl --out task-report.json
+
+# print a human-readable task report from the latest session in the current project
+openclaude report --markdown
+
 # full local hardening check (smoke + runtime doctor)
 bun run hardening:check
 
@@ -391,6 +547,7 @@ Notes:
 - Local providers such as `http://localhost:11434/v1`, `http://10.0.0.1:11434/v1`, and `http://127.0.0.1:1337/v1` can run without `OPENAI_API_KEY`.
 - Codex profiles validate `CODEX_API_KEY` or the Codex CLI auth file and probe `POST /responses` instead of `GET /models`.
 - `openclaude doctor report` is redacted by default and is intended for GitHub issues. It summarizes provider/runtime/build/settings state without prompts, transcripts, raw settings files, API keys, MCP command details, or full home-directory paths.
+- `openclaude report --json` and `openclaude report --markdown` summarize observed session facts such as tool uses, Bash commands, validation commands, changed files, branch metadata, warnings, and linked issue/PR references. Use `--transcript <file>` for an explicit transcript, `--session <id>` for a stored session, or omit both to report the latest session for the current project. Large previews are truncated and credential-shaped strings are redacted. When no validation command is observed, the report keeps `validations` empty and includes a warning instead of claiming checks passed.
 
 ## Provider Launch Profiles
 
@@ -471,6 +628,18 @@ Supported values:
   profile-only custom model IDs.
 - `profile`: show only explicitly configured profile models.
 
+When the provider-profile env workflow is active (i.e. a profile has been
+applied and `CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED=1` is set — as it is after
+launching with a saved profile) and you have more than one saved provider
+profile, `/model` also lists models from your **inactive** profiles, grouped
+under their profile name. Selecting one activates that provider profile and
+switches to the chosen model in a single step, reconciling fast mode if the
+target provider cannot run it. These cross-profile entries appear only in the
+interactive `/model` picker — they are never returned to SDK/automation callers
+and are hidden from inline pickers (such as the prompt hotkey or Settings),
+which cannot switch the active profile. Simply having multiple profiles
+configured without the env workflow active does not surface them.
+
 Use `--provider ollama` when you want a local-only path. Auto mode falls back to OpenAI when no viable local chat model is installed.
 
 Use `--provider atomic-chat` when you want Atomic Chat as the local Apple Silicon provider.
@@ -486,9 +655,14 @@ For `dev:atomic-chat`, make sure Atomic Chat is running with a model loaded befo
 
 ## Message-Count Compaction Threshold
 
-By default, OpenClaude compacts conversations based on token usage. A secondary
-message-count-based trigger (`OPENCLAUDE_MAX_ACTIVE_MESSAGES`) exists for
-diagnostics but is disabled by default.
+By default, OpenClaude compacts conversations based on token usage and also
+applies a safety hard cap of 1000 active messages. The hard cap catches long
+sessions that accumulate many small messages with negligible token cost.
+
+This hard cap is a safety net: it can still trigger compaction even when
+`DISABLE_COMPACT`, `DISABLE_AUTO_COMPACT`, or a disabled auto-compact setting
+would otherwise prevent it. Set `OPENCLAUDE_MAX_ACTIVE_MESSAGES_HARD_CAP=0`
+only when you need to suppress that safety cap for diagnostics.
 
 If you frequently resume long sessions that accumulate hundreds of small
 tool-result messages with negligible token cost, you can opt in to message-count
@@ -499,10 +673,26 @@ compaction via the in-app `/config` command:
 ```
 
 Select **Message-count compaction** and choose a threshold (`100`, `200`, `500`,
-or `1000`). Setting it to `off` (default) disables the message-count trigger.
+or `1000`). Setting it to `off` (default) leaves only the built-in hard cap.
 
 This setting is intended for power users debugging specific edge cases. Most
 users should leave it at `off`.
 
 The legacy `OPENCLAUDE_MAX_ACTIVE_MESSAGES` environment variable is still
-honored when the setting is `off`.
+honored when the setting is `off`. `OPENCLAUDE_MAX_ACTIVE_MESSAGES_HARD_CAP`
+can override the safety cap; set it to `0` only for diagnostics.
+
+### Long-session memory guard validation
+
+For changes that touch auto-compact, provider request conversion, transcript
+retention, or in-process teammates, run the focused long-session guard checks:
+
+```bash
+bun test --feature=UNATTENDED_RETRY src/query/autoCompactCooldown.test.ts src/utils/maxActiveMessages.test.ts src/services/api/openaiShim.test.ts
+```
+
+These tests cover repeated over-cap turns, auto-compact cooldown blocking,
+teammate active-message compaction, malformed hard-cap overrides, and
+pruned-history tool-call/tool-result pairing. They are not a substitute for a
+multi-hour manual soak, but they pin the bounded-history and conversion
+invariants that previously let long sessions grow until Node/V8 OOM.

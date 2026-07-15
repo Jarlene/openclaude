@@ -1,5 +1,5 @@
 import { afterEach, describe, test, expect, vi } from 'vitest'
-import { QueryGuard } from './QueryGuard.js'
+import { DEFAULT_QUERY_HARD_MAX_MS, QueryGuard } from './QueryGuard.js'
 import { QueryLifecycleOperationTracker } from './queryLifecycle.js'
 
 describe('QueryGuard', () => {
@@ -347,6 +347,48 @@ describe('QueryGuard', () => {
     )
   })
 
+  test('larger hard maximum does not abort at the default hard max boundary', () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const configuredHardMaxMs = DEFAULT_QUERY_HARD_MAX_MS + 1_000
+    const guard = new QueryGuard({
+      idleTimeoutMs: 100,
+      hardMaxQueryMs: configuredHardMaxMs,
+      toolLeaseGraceMs: 0,
+    })
+    const onTimeout = vi.fn()
+    guard.setTimeoutHandler(onTimeout)
+    const gen = guard.tryStart()!
+    guard.acquireLease(
+      {
+        owner: 'api',
+        id: 'stream',
+        timeoutMs: configuredHardMaxMs,
+      },
+      gen,
+    )
+
+    vi.advanceTimersByTime(DEFAULT_QUERY_HARD_MAX_MS)
+
+    expect(guard.isActive).toBe(true)
+    expect(onTimeout).not.toHaveBeenCalled()
+
+    vi.advanceTimersByTime(1_000)
+
+    expect(guard.isActive).toBe(false)
+    expect(onTimeout).toHaveBeenCalledWith(
+      expect.objectContaining({
+        generation: gen,
+        reason: 'hard_max',
+        timeoutMs: configuredHardMaxMs,
+        context: expect.objectContaining({
+          terminalReason: 'hard-max-query-timeout',
+          abortReason: 'hard_max',
+        }),
+      }),
+    )
+  })
+
   test('lease hard cap is relative to acquisition and capped by query remaining budget', () => {
     vi.useFakeTimers()
     vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -480,6 +522,151 @@ describe('QueryGuard', () => {
     expect(guard.isActive).toBe(true)
 
     guard.forceEnd()
+  })
+
+  describe('beginUserInteraction (human-wait suspension)', () => {
+    test('idle timeout does not fire while suspended', () => {
+      vi.useFakeTimers()
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const guard = new QueryGuard({ idleTimeoutMs: 100, hardMaxQueryMs: 1_000 })
+      guard.tryStart()
+
+      const resume = guard.beginUserInteraction()
+      // Well past the idle timeout, but the user is still deciding.
+      vi.advanceTimersByTime(100_000)
+      expect(guard.isActive).toBe(true)
+
+      resume()
+      // Idle window restarts fresh from resume.
+      vi.advanceTimersByTime(99)
+      expect(guard.isActive).toBe(true)
+      vi.advanceTimersByTime(1)
+      expect(guard.isActive).toBe(false)
+    })
+
+    test('hard-max deadline is shifted forward by the paused duration', () => {
+      vi.useFakeTimers()
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const guard = new QueryGuard({
+        idleTimeoutMs: 10_000,
+        hardMaxQueryMs: 1_000,
+      })
+      guard.tryStart()
+
+      vi.advanceTimersByTime(500)
+      const resume = guard.beginUserInteraction()
+      vi.advanceTimersByTime(5_000) // human think-time, excluded from budget
+      resume()
+
+      // 500ms of the 1000ms hard-max was spent before the pause; 500ms remain.
+      vi.advanceTimersByTime(499)
+      expect(guard.isActive).toBe(true)
+      vi.advanceTimersByTime(1)
+      expect(guard.isActive).toBe(false)
+    })
+
+    test('lease deadlines continue while suspended', () => {
+      vi.useFakeTimers()
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const guard = new QueryGuard({
+        idleTimeoutMs: 10_000,
+        hardMaxQueryMs: 10_000,
+        toolLeaseGraceMs: 1,
+      })
+      const onTimeout = vi.fn()
+      guard.setTimeoutHandler(onTimeout)
+      guard.tryStart()
+      guard.acquireLease({ owner: 'tool', id: 'slow-read', timeoutMs: 100 })
+
+      guard.beginUserInteraction()
+      vi.advanceTimersByTime(100)
+      expect(guard.isActive).toBe(true)
+      vi.advanceTimersByTime(1)
+
+      expect(guard.isActive).toBe(false)
+      expect(onTimeout).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'lease_expired' }),
+      )
+    })
+
+    test('lease hard cap acquired during suspension excludes human wait', () => {
+      vi.useFakeTimers()
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const guard = new QueryGuard({
+        idleTimeoutMs: 10_000,
+        hardMaxQueryMs: 1_000,
+      })
+      const onTimeout = vi.fn()
+      guard.setTimeoutHandler(onTimeout)
+      guard.tryStart()
+
+      vi.advanceTimersByTime(900)
+      guard.beginUserInteraction()
+      vi.advanceTimersByTime(5_000)
+      guard.acquireLease({ owner: 'tool', id: 'during-prompt' })
+
+      vi.advanceTimersByTime(99)
+      expect(guard.isActive).toBe(true)
+      vi.advanceTimersByTime(1)
+
+      expect(guard.isActive).toBe(false)
+      expect(onTimeout).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'lease_expired' }),
+      )
+    })
+
+    test('reference counts nested interactions', () => {
+      vi.useFakeTimers()
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const guard = new QueryGuard({ idleTimeoutMs: 100, hardMaxQueryMs: 10_000 })
+      guard.tryStart()
+
+      const resumeA = guard.beginUserInteraction()
+      const resumeB = guard.beginUserInteraction()
+      vi.advanceTimersByTime(1_000)
+      resumeA()
+      // Still suspended by B — watchdog stays frozen.
+      vi.advanceTimersByTime(1_000)
+      expect(guard.isActive).toBe(true)
+
+      resumeB()
+      vi.advanceTimersByTime(100)
+      expect(guard.isActive).toBe(false)
+    })
+
+    test('repeated resume calls are ignored', () => {
+      vi.useFakeTimers()
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const guard = new QueryGuard({ idleTimeoutMs: 100, hardMaxQueryMs: 10_000 })
+      guard.tryStart()
+
+      const resume = guard.beginUserInteraction()
+      resume()
+      resume() // no-op, must not underflow the suspend counter
+
+      const resume2 = guard.beginUserInteraction()
+      vi.advanceTimersByTime(1_000)
+      expect(guard.isActive).toBe(true)
+      resume2()
+      vi.advanceTimersByTime(100)
+      expect(guard.isActive).toBe(false)
+    })
+
+    test('suspending a stale generation is a no-op', () => {
+      vi.useFakeTimers()
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const guard = new QueryGuard({ idleTimeoutMs: 100, hardMaxQueryMs: 10_000 })
+      const gen1 = guard.tryStart()!
+      guard.forceEnd()
+      guard.tryStart()
+
+      // Resume tied to the old generation must not affect the current query.
+      const staleResume = guard.beginUserInteraction(gen1)
+      staleResume()
+
+      vi.advanceTimersByTime(100)
+      expect(guard.isActive).toBe(false)
+    })
   })
 })
 

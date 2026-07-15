@@ -26,6 +26,7 @@ import {
 } from './routeMetadata.js'
 import { parseCustomHeadersEnv } from '../utils/providerCustomHeaders.js'
 import { firstUsableCredential } from '../services/api/credentialPool.js'
+import { ZAI_GLM_OPENAI_SHIM } from './transport/zaiGlmShim.js'
 
 function normalizeModelApiName(
   value: string | undefined,
@@ -52,6 +53,14 @@ function matchesCatalogEntryModel(
   modelApiName: string,
 ): boolean {
   if (entry.apiName.trim().toLowerCase() === modelApiName) {
+    return true
+  }
+
+  if (
+    (entry.aliases ?? []).some(
+      alias => normalizeModelApiName(alias) === modelApiName,
+    )
+  ) {
     return true
   }
 
@@ -156,6 +165,7 @@ export function openAIShimSupportsApiFormatForModel(
 
 function inferRemoteModelOpenAIShimConfig(
   modelApiName: string | undefined,
+  catalogEntry: ModelCatalogEntry | null,
 ): Partial<OpenAIShimTransportConfig> | undefined {
   const normalizedModel = normalizeModelApiName(modelApiName)
   if (!normalizedModel) {
@@ -199,6 +209,26 @@ function inferRemoteModelOpenAIShimConfig(
     }
   }
 
+  // Only infer the Z.AI GLM shim for routes without a catalog entry
+  // (direct/aggregator aliases like `glm-5.2` or `openrouter/zhipu/glm-5.2`).
+  // Catalog-backed GLM routes declare their own contract via
+  // `transportOverrides.openaiShim`: Z.AI-contract routes (zai, opencode-go,
+  // atlas-cloud) opt in explicitly, while non-Z.AI ones (nearai, fireworks)
+  // keep their provider-specific request shape instead of this shim.
+  const hasGlm = segments.some(s => /^glm-\d/.test(s))
+  const isFireworks = segments.some(s => s === 'fireworks')
+  if (hasGlm && !isFireworks && !catalogEntry) {
+    // `tool_stream` is a Z.AI-proprietary streaming extension. Only a catalog
+    // entry may opt into it (Z.AI-contract gateways set it via
+    // `transportOverrides.openaiShim`); it must not be inferred from the model
+    // name alone. An arbitrary OpenAI-compatible gateway serving GLM — e.g.
+    // NVIDIA NIM (`integrate.api.nvidia.com`) — rejects the request with
+    // `400 Unsupported parameter(s): tool_stream` (#1896). Keep the
+    // reasoning-shaping fields (which any GLM endpoint benefits from) but drop
+    // tool streaming; without it tool calls simply aren't streamed.
+    return { ...ZAI_GLM_OPENAI_SHIM, enableToolStreaming: false }
+  }
+
   return undefined
 }
 
@@ -220,6 +250,7 @@ export function resolveOpenAIShimRuntimeContext(options?: {
   model?: string
   activeProfileProvider?: string
   treatAsLocal?: boolean
+  preferBaseUrlRoute?: boolean
 }): OpenAIShimRuntimeContext {
   const processEnv = options?.processEnv ?? process.env
   const runtimeEnv: NodeJS.ProcessEnv = {
@@ -236,13 +267,16 @@ export function resolveOpenAIShimRuntimeContext(options?: {
 
   const activeRouteId = resolveActiveRouteIdFromEnv(runtimeEnv, {
     activeProfileProvider: options?.activeProfileProvider,
+    activeProfileBaseUrl: options?.baseUrl,
   })
   const baseUrlRouteId = resolveRouteIdFromBaseUrl(options?.baseUrl)
   const routeId =
-    baseUrlRouteId &&
-    (!activeRouteId || activeRouteId === 'anthropic' || activeRouteId === 'openai')
+    options?.preferBaseUrlRoute && options.baseUrl !== undefined
       ? baseUrlRouteId
-      : activeRouteId
+      : baseUrlRouteId &&
+        (!activeRouteId || activeRouteId === 'anthropic' || activeRouteId === 'openai')
+        ? baseUrlRouteId
+        : activeRouteId
   const descriptor =
     routeId && routeId !== 'anthropic'
       ? getRouteDescriptor(routeId)
@@ -256,7 +290,7 @@ export function resolveOpenAIShimRuntimeContext(options?: {
       ? {
           maxTokensField: 'max_tokens' as const,
         }
-      : inferRemoteModelOpenAIShimConfig(options?.model)
+      : inferRemoteModelOpenAIShimConfig(options?.model, catalogEntry)
 
   return {
     routeId,
@@ -427,7 +461,8 @@ export function resolveModelRuntimeLimits(options: {
   }
 
   const routeId = resolveActiveRouteIdFromEnv(runtimeEnv, {
-    activeProfileProvider: options.activeProfileProvider,
+    activeProfileProvider: options?.activeProfileProvider,
+    activeProfileBaseUrl: options?.baseUrl,
   })
   const modelApiName = getBaseModelApiName(options.model) ?? options.model
   const catalogEntry = findCatalogEntryForApiName(routeId, modelApiName)
@@ -449,18 +484,28 @@ export function resolveModelRuntimeLimits(options: {
     runtimeEnv,
   )
 
+  // Precedence: an exact env override wins outright; then the built-in
+  // catalog / discovery-cache value (a `:cloud` variant must take its known
+  // catalog limit rather than inherit a broad base-model env *prefix*); then a
+  // broad env *prefix* override; then the settings.json `modelLimits` override;
+  // then the descriptor default. The key fix for the env/settings drift is
+  // keeping `settings` strictly below `prefix` so a broad env-prefix override is
+  // never silently overtaken by a settings entry — matching the scalar
+  // getOpenAIContextWindow, where env (exact or prefix) beats settings.
   return {
     contextWindow:
       externalContextWindow.exact ??
       catalogEntry?.contextWindow ??
       cachedCatalogEntry?.contextWindow ??
       externalContextWindow.prefix ??
+      externalContextWindow.settings ??
       modelDescriptor?.contextWindow,
     maxOutputTokens:
       externalMaxOutputTokens.exact ??
       catalogEntry?.maxOutputTokens ??
       cachedCatalogEntry?.maxOutputTokens ??
       externalMaxOutputTokens.prefix ??
+      externalMaxOutputTokens.settings ??
       modelDescriptor?.maxOutputTokens,
   }
 }

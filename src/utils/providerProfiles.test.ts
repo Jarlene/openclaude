@@ -17,6 +17,7 @@ const originalCwd = process.cwd()
 const RESTORED_KEYS = [
   'CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED',
   'CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID',
+  'CLAUDE_CODE_PROVIDER_ROUTE_ID',
   'CLAUDE_CONFIG_DIR',
   'CLAUDE_CODE_USE_OPENAI',
   'CLAUDE_CODE_USE_GEMINI',
@@ -62,10 +63,13 @@ const RESTORED_KEYS = [
   'BNKR_API_KEY',
   'BANKR_MODEL',
   'XAI_API_KEY',
+  'AIMLAPI_API_KEY',
   'VENICE_API_KEY',
   'MIMO_API_KEY',
   'ATLAS_CLOUD_API_KEY',
+  'CLINE_API_KEY',
   'HICAP_API_KEY',
+  'CLOUDFLARE_API_TOKEN',
   'CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS',
 ] as const
 
@@ -257,6 +261,30 @@ function buildAtlasCloudProfile(overrides: Partial<ProviderProfile> = {}): Provi
   })
 }
 
+function buildClinePassProfile(overrides: Partial<ProviderProfile> = {}): ProviderProfile {
+  return buildProfile({
+    provider: 'clinepass',
+    name: 'ClinePass',
+    baseUrl: 'https://api.cline.bot/api/v1',
+    model: 'cline-pass/deepseek-v4-flash',
+    apiKey: 'cline-test-key',
+    ...overrides,
+  })
+}
+
+function buildCloudflareProfile(overrides: Partial<ProviderProfile> = {}): ProviderProfile {
+  return buildProfile({
+    provider: 'cloudflare',
+    name: 'Cloudflare Workers AI',
+    // Account-scoped URL — users substitute `<ACCOUNT_ID>` for their account.
+    // Tests use a literal id so host-matching for the descriptor is exercised.
+    baseUrl: 'https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1',
+    model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    apiKey: 'cloudflare-test-token',
+    ...overrides,
+  })
+}
+
 describe('applyProviderProfileToProcessEnv', () => {
   test('openai profile clears competing gemini/github flags', async () => {
     const { applyProviderProfileToProcessEnv } =
@@ -275,7 +303,7 @@ describe('applyProviderProfileToProcessEnv', () => {
       'provider_test',
     )
     expect(getFreshAPIProvider()).toBe('openai')
-  })
+  }, 20_000)
 
   test('mistral profile sets CLAUDE_CODE_USE_MISTRAL and clears openai flags', async () => {
     const { applyProviderProfileToProcessEnv } =
@@ -650,7 +678,7 @@ describe('applyProviderProfileToProcessEnv', () => {
       buildProfile({
         provider: 'openai',
         baseUrl: 'https://api.hicap.ai/v1',
-        model: 'claude-opus-4.7',
+        model: 'claude-opus-4.8',
         authHeader: 'api-key',
         authScheme: 'raw',
         authHeaderValue: 'hicap-header-value',
@@ -749,6 +777,133 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(getFreshAPIProvider()).toBe('openai')
   })
 
+  test('cloudflare profile applies OpenAI-compatible env with CLOUDFLARE_API_TOKEN mirror', async () => {
+    // Account-scoped URL: a real user has substituted `<ACCOUNT_ID>` for their
+    // Cloudflare account id. The env-build path should mirror the api key into
+    // `CLOUDFLARE_API_TOKEN` so the descriptor's host-based route detection
+    // picks the cloudflare preset back up on the next reload.
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.CLAUDE_CODE_USE_GEMINI = '1'
+
+    applyProviderProfileToProcessEnv(buildCloudflareProfile())
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+
+    expect(process.env.CLAUDE_CODE_USE_GEMINI).toBeUndefined()
+    expect(String(process.env.CLAUDE_CODE_USE_OPENAI)).toBe('1')
+    expect(process.env.OPENAI_BASE_URL).toBe(
+      'https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1',
+    )
+    expect(process.env.OPENAI_MODEL).toBe(
+      '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    )
+    expect(process.env.OPENAI_API_KEY).toBe('cloudflare-test-token')
+    expect(process.env.CLOUDFLARE_API_TOKEN).toBe('cloudflare-test-token')
+    expect(getFreshAPIProvider()).toBe('openai')
+  })
+
+  test('cloudflare profile retargeted to the shared AI Gateway host does not mirror CLOUDFLARE_API_TOKEN', async () => {
+    // gateway.ai.cloudflare.com is a shared AI Gateway host that fronts other
+    // providers (openai/anthropic/...). A cloudflare profile keeps
+    // routeId === 'cloudflare', but the token must NOT be mirrored when the
+    // base URL is the shared gateway, otherwise the profile stays tied to the
+    // cloudflare route through the descriptor's host-based detection.
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildCloudflareProfile({
+        baseUrl:
+          'https://gateway.ai.cloudflare.com/v1/abc123/my-gateway/openai',
+      }),
+    )
+
+    expect(process.env.CLOUDFLARE_API_TOKEN).toBeUndefined()
+    expect(process.env.OPENAI_API_KEY).toBe('cloudflare-test-token')
+  })
+
+  test('cloudflare profile retargeted off Workers AI keeps generic OpenAI-compatible capabilities', async () => {
+    // The Cloudflare route strips apiFormat/custom-auth/custom-header options
+    // (Workers AI has a fixed transport). Once the base URL is retargeted away
+    // from the real Workers AI endpoint, the runtime runs it as a generic
+    // OpenAI-compatible route, so profile capability resolution must fall back
+    // to the generic route and preserve those options instead of dropping them
+    // based on the stale cloudflare route id.
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildCloudflareProfile({
+        baseUrl:
+          'https://gateway.ai.cloudflare.com/v1/abc123/my-gateway/openai',
+        apiFormat: 'responses',
+      }),
+    )
+
+    // apiFormat survives because the retargeted profile resolves to a generic
+    // OpenAI-compatible route (which supports format selection), not cloudflare.
+    expect(process.env.OPENAI_API_FORMAT).toBe('responses')
+    // …and the Cloudflare token is still not mirrored to a non-Workers host.
+    expect(process.env.CLOUDFLARE_API_TOKEN).toBeUndefined()
+  })
+
+  test('cloudflare profile on a non-Workers api.cloudflare.com path does not mirror CLOUDFLARE_API_TOKEN', async () => {
+    // Same api.cloudflare.com host, but the REST management path — NOT Workers
+    // AI. The mirror is gated on the isCloudflareBaseUrl path predicate, so the
+    // token must not be attached to this non-Workers endpoint even though the
+    // host matches.
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildCloudflareProfile({
+        baseUrl: 'https://api.cloudflare.com/client/v4/user/tokens/verify',
+      }),
+    )
+
+    expect(process.env.CLOUDFLARE_API_TOKEN).toBeUndefined()
+    expect(process.env.OPENAI_API_KEY).toBe('cloudflare-test-token')
+  })
+
+  test('cloudflare profile on a non-Workers api.cloudflare.com path does not persist CLOUDFLARE_API_TOKEN', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const nonWorkersProfile = buildCloudflareProfile({
+        id: 'cloudflare_non_workers',
+        baseUrl: 'https://api.cloudflare.com/client/v4/user/tokens/verify',
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [nonWorkersProfile],
+      }))
+
+      const result = setActiveProviderProfile('cloudflare_non_workers', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('cloudflare_non_workers')
+      // The base URL / key are still persisted, but the dedicated Workers AI
+      // token must not be, since this is not a Workers AI endpoint.
+      expect(persisted.env.OPENAI_API_KEY).toBe('cloudflare-test-token')
+      expect(persisted.env.CLOUDFLARE_API_TOKEN).toBeUndefined()
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
   test('xiaomi mimo profile normalizes stale docs endpoint to resolving API host', async () => {
     const { applyProviderProfileToProcessEnv } =
       await importFreshProviderProfileModules()
@@ -826,6 +981,131 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(process.env.OPENAI_API_KEY).toBe('fireworks-test-key')
     expect(process.env.FIREWORKS_API_KEY).toBe('fireworks-test-key')
     expect(getFreshAPIProvider()).toBe('openai')
+  })
+
+  test('aimlapi profile applies OpenAI-compatible env with AIMLAPI_API_KEY mirror', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        name: 'AI/ML API',
+        provider: 'aimlapi',
+        baseUrl: 'https://api.aimlapi.com/v1',
+        model: 'gpt-4o',
+        apiKey: 'aimlapi-test-key',
+      }),
+    )
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://api.aimlapi.com/v1')
+    expect(process.env.OPENAI_MODEL).toBe('gpt-4o')
+    expect(process.env.OPENAI_API_KEY).toBe('aimlapi-test-key')
+    expect(process.env.AIMLAPI_API_KEY).toBe('aimlapi-test-key')
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('aimlapi')
+    expect(getFreshAPIProvider()).toBe('openai')
+  }, 20_000)
+
+  test('keyless custom AIMLAPI profile preserves route identity with ambient OpenAI key', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.OPENAI_API_KEY = 'ambient-openai-key'
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        name: 'AI/ML API Proxy',
+        provider: 'aimlapi',
+        baseUrl: 'https://proxy.example.com/v1',
+        model: 'gpt-4o',
+      }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://proxy.example.com/v1')
+    expect(process.env.OPENAI_MODEL).toBe('gpt-4o')
+    expect(process.env.OPENAI_API_KEY).toBe('ambient-openai-key')
+    expect(process.env.AIMLAPI_API_KEY).toBe('ambient-openai-key')
+    expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('aimlapi')
+  }, 20_000)
+
+  test('openai profile on AI/ML API route mirrors AIMLAPI_API_KEY', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'openai',
+        baseUrl: 'https://api.aimlapi.com/v1',
+        model: 'gpt-4o',
+        apiKey: 'aimlapi-test-key',
+      }),
+    )
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://api.aimlapi.com/v1')
+    expect(process.env.OPENAI_MODEL).toBe('gpt-4o')
+    expect(process.env.OPENAI_API_KEY).toBe('aimlapi-test-key')
+    expect(process.env.AIMLAPI_API_KEY).toBe('aimlapi-test-key')
+    expect(getFreshAPIProvider()).toBe('openai')
+  }, 20_000)
+
+  test('ClinePass preset profile applies OpenAI-compatible env with CLINE_API_KEY mirror', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    process.env.CLAUDE_CODE_USE_GEMINI = '1'
+
+    applyProviderProfileToProcessEnv(buildClinePassProfile())
+    const { getAPIProvider: getFreshAPIProvider } =
+      await importFreshProvidersModule()
+
+    expect(process.env.CLAUDE_CODE_USE_GEMINI).toBeUndefined()
+    expect(String(process.env.CLAUDE_CODE_USE_OPENAI)).toBe('1')
+    expect(process.env.OPENAI_BASE_URL).toBe('https://api.cline.bot/api/v1')
+    expect(process.env.OPENAI_MODEL).toBe('cline-pass/deepseek-v4-flash')
+    expect(process.env.OPENAI_API_KEY).toBe('cline-test-key')
+    expect(process.env.CLINE_API_KEY).toBe('cline-test-key')
+    expect(getFreshAPIProvider()).toBe('openai')
+  })
+
+  test('custom openai profile targeting ClinePass base URL applies CLINE_API_KEY mirror', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'openai',
+        name: 'Custom ClinePass',
+        baseUrl: 'https://api.cline.bot/api/v1',
+        model: 'cline-pass/qwen3.7-max',
+        apiKey: 'custom-cline-key',
+      }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://api.cline.bot/api/v1')
+    expect(process.env.OPENAI_MODEL).toBe('cline-pass/qwen3.7-max')
+    expect(process.env.OPENAI_API_KEY).toBe('custom-cline-key')
+    expect(process.env.CLINE_API_KEY).toBe('custom-cline-key')
+  })
+
+  test('ClinePass provider with custom base URL applies CLINE_API_KEY mirror', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'clinepass',
+        name: 'ClinePass Custom',
+        baseUrl: 'https://custom.cline.bot/v1',
+        model: 'cline-pass/qwen3.7-max',
+        apiKey: 'custom-cline-key',
+      }),
+    )
+
+    expect(process.env.OPENAI_BASE_URL).toBe('https://custom.cline.bot/v1')
+    expect(process.env.OPENAI_MODEL).toBe('cline-pass/qwen3.7-max')
+    expect(process.env.OPENAI_API_KEY).toBe('custom-cline-key')
+    expect(process.env.CLINE_API_KEY).toBe('custom-cline-key')
   })
 
   test('legacy OpenAI profile on restricted route ignores advanced settings', async () => {
@@ -1121,6 +1401,207 @@ describe('getProviderProfiles', () => {
     expect(byId('infinity')?.maxContextLength).toBeUndefined()
     expect(byId('string')?.maxContextLength).toBeUndefined()
     expect(byId('missing')?.maxContextLength).toBeUndefined()
+  })
+})
+
+describe('clearActiveProviderProfile', () => {
+  test('returns undefined active profile while preserving saved profiles (#1426)', async () => {
+    const {
+      getActiveProviderProfile,
+      clearActiveProviderProfile,
+      getProviderProfiles,
+      ANTHROPIC_DEFAULT_PROFILE_ID,
+    } = await importFreshProviderProfileModules()
+
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [
+        buildProfile({ id: 'saved_deepseek', name: 'DeepSeek' }),
+      ],
+      activeProviderProfileId: 'saved_deepseek',
+    }))
+
+    expect(getActiveProviderProfile()?.id).toBe('saved_deepseek')
+
+    const hadActive = clearActiveProviderProfile()
+
+    expect(hadActive).toBe(true)
+    expect(mockConfigState.activeProviderProfileId).toBe(
+      ANTHROPIC_DEFAULT_PROFILE_ID,
+    )
+    // Falls back to Anthropic, NOT to profiles[0].
+    expect(getActiveProviderProfile()).toBeUndefined()
+    // Saved profiles remain for later re-selection.
+    expect(getProviderProfiles()).toHaveLength(1)
+  })
+
+  test('clears managed provider env from the current session', async () => {
+    const { clearActiveProviderProfile } =
+      await importFreshProviderProfileModules()
+
+    process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED = '1'
+    process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID = 'saved_deepseek'
+    // Managed provider env that a third-party profile would have applied.
+    process.env.CLAUDE_CODE_USE_OPENAI = '1'
+    process.env.OPENAI_BASE_URL = 'https://api.deepseek.com'
+    process.env.OPENAI_API_KEY = 'sk-test'
+
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [buildProfile({ id: 'saved_deepseek' })],
+      activeProviderProfileId: 'saved_deepseek',
+    }))
+
+    clearActiveProviderProfile()
+
+    expect(
+      process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED,
+    ).toBeUndefined()
+    expect(
+      process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID,
+    ).toBeUndefined()
+    // The managed provider env itself must be gone too, otherwise the switch
+    // back to Anthropic would not take effect for the current session.
+    expect(process.env.CLAUDE_CODE_USE_OPENAI).toBeUndefined()
+    expect(process.env.OPENAI_BASE_URL).toBeUndefined()
+    expect(process.env.OPENAI_API_KEY).toBeUndefined()
+  })
+})
+
+describe('Anthropic sentinel survives profile management (#1426)', () => {
+  test('addProviderProfile with makeActive:false keeps the Anthropic sentinel active', async () => {
+    const {
+      addProviderProfile,
+      getActiveProviderProfile,
+      ANTHROPIC_DEFAULT_PROFILE_ID,
+    } = await importFreshProviderProfileModules()
+
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [buildProfile({ id: 'saved_one', name: 'Saved One' })],
+      activeProviderProfileId: ANTHROPIC_DEFAULT_PROFILE_ID,
+    }))
+
+    addProviderProfile(
+      {
+        provider: 'openai',
+        name: 'Saved Two',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o',
+      },
+      { makeActive: false },
+    )
+
+    expect(mockConfigState.activeProviderProfileId).toBe(
+      ANTHROPIC_DEFAULT_PROFILE_ID,
+    )
+    expect(getActiveProviderProfile()).toBeUndefined()
+  })
+
+  test('addProviderProfile with makeActive:false keeps the implicit first profile active when no active id is set', async () => {
+    const { addProviderProfile, getActiveProviderProfile } =
+      await importFreshProviderProfileModules()
+
+    // activeProviderProfileId unset, but a saved profile exists. getActiveProviderProfile
+    // implicitly resolves this to the first profile, so adding another with
+    // makeActive:false must not silently promote the new one.
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [buildProfile({ id: 'saved_one', name: 'Saved One' })],
+      activeProviderProfileId: undefined,
+    }))
+
+    addProviderProfile(
+      {
+        provider: 'openai',
+        name: 'Saved Two',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o',
+      },
+      { makeActive: false },
+    )
+
+    expect(getActiveProviderProfile()?.id).toBe('saved_one')
+  })
+
+  test('addProviderProfile with makeActive:false keeps the resolved first profile active when the active id is stale', async () => {
+    const { addProviderProfile, getActiveProviderProfile } =
+      await importFreshProviderProfileModules()
+
+    // activeProviderProfileId points at a profile that no longer exists.
+    // getActiveProviderProfile resolves a stale id to the first profile, so
+    // adding another with makeActive:false must keep that first profile active
+    // rather than promoting the new one (#1426).
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [buildProfile({ id: 'saved_one', name: 'Saved One' })],
+      activeProviderProfileId: 'deleted_profile_id',
+    }))
+
+    addProviderProfile(
+      {
+        provider: 'openai',
+        name: 'Saved Two',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o',
+      },
+      { makeActive: false },
+    )
+
+    expect(getActiveProviderProfile()?.id).toBe('saved_one')
+  })
+
+  test('updateProviderProfile of a non-active profile keeps the Anthropic sentinel active', async () => {
+    const {
+      updateProviderProfile,
+      getActiveProviderProfile,
+      ANTHROPIC_DEFAULT_PROFILE_ID,
+    } = await importFreshProviderProfileModules()
+
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [buildProfile({ id: 'saved_one', name: 'Saved One' })],
+      activeProviderProfileId: ANTHROPIC_DEFAULT_PROFILE_ID,
+    }))
+
+    updateProviderProfile('saved_one', {
+      provider: 'openai',
+      name: 'Saved One Renamed',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o',
+    })
+
+    expect(mockConfigState.activeProviderProfileId).toBe(
+      ANTHROPIC_DEFAULT_PROFILE_ID,
+    )
+    expect(getActiveProviderProfile()).toBeUndefined()
+  })
+
+  test('deleteProviderProfile of an inactive profile keeps the Anthropic sentinel active', async () => {
+    const {
+      deleteProviderProfile,
+      getActiveProviderProfile,
+      getProviderProfiles,
+      ANTHROPIC_DEFAULT_PROFILE_ID,
+    } = await importFreshProviderProfileModules()
+
+    saveMockGlobalConfig(current => ({
+      ...current,
+      providerProfiles: [
+        buildProfile({ id: 'saved_one', name: 'Saved One' }),
+        buildProfile({ id: 'saved_two', name: 'Saved Two' }),
+      ],
+      activeProviderProfileId: ANTHROPIC_DEFAULT_PROFILE_ID,
+    }))
+
+    const result = deleteProviderProfile('saved_one')
+
+    expect(result.removed).toBe(true)
+    expect(mockConfigState.activeProviderProfileId).toBe(
+      ANTHROPIC_DEFAULT_PROFILE_ID,
+    )
+    expect(getActiveProviderProfile()).toBeUndefined()
+    expect(getProviderProfiles()).toHaveLength(1)
   })
 })
 
@@ -1448,6 +1929,31 @@ describe('applyActiveProviderProfileFromConfig', () => {
     expect(String(process.env.FIREWORKS_API_KEY)).toBe('fireworks-test-key')
   })
 
+  test('re-applies AI/ML API active profile when AIMLAPI_API_KEY is missing (env drift)', async () => {
+    const { applyActiveProviderProfileFromConfig, applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+    const aimlapiProfile = buildProfile({
+      id: 'saved_aimlapi',
+      provider: 'aimlapi',
+      name: 'AI/ML API',
+      baseUrl: 'https://api.aimlapi.com/v1',
+      model: 'gpt-4o',
+      apiKey: 'aimlapi-test-key',
+    })
+    applyProviderProfileToProcessEnv(aimlapiProfile)
+
+    // Simulate relaunch where the shell exported OPENAI vars but not AIMLAPI_API_KEY
+    delete process.env.AIMLAPI_API_KEY
+
+    const applied = applyActiveProviderProfileFromConfig({
+      providerProfiles: [aimlapiProfile],
+      activeProviderProfileId: 'saved_aimlapi',
+    } as any)
+
+    expect(applied?.id).toBe('saved_aimlapi')
+    expect(String(process.env.AIMLAPI_API_KEY)).toBe('aimlapi-test-key')
+  })
+
   test('does not re-apply xai active profile when XAI_API_KEY is aligned', async () => {
     const { applyActiveProviderProfileFromConfig, applyProviderProfileToProcessEnv } =
       await importFreshProviderProfileModules()
@@ -1498,6 +2004,116 @@ describe('applyActiveProviderProfileFromConfig', () => {
     expect(String(process.env.CLAUDE_CODE_USE_OPENAI)).toBe('1')
     expect(process.env.OPENAI_BASE_URL).toBe('https://api.openai.com/v1')
     expect(process.env.OPENAI_MODEL).toBe('gpt-4o')
+  })
+
+  test('uses saved valid Hicap /model choice when rehydrating active profile', async () => {
+    const {
+      _setSavedModelOverrideForTesting,
+      applyActiveProviderProfileFromConfig,
+      getProviderProfiles,
+    } = await importFreshProviderProfileModules()
+    _setSavedModelOverrideForTesting('gpt-5.4')
+    const activeProfile = buildProfile({
+      id: 'saved_hicap',
+      provider: 'hicap',
+      baseUrl: 'https://api.hicap.ai/v1',
+      model: 'glm-5.2',
+    })
+
+    const applied = applyActiveProviderProfileFromConfig({
+      providerProfiles: [activeProfile],
+      activeProviderProfileId: activeProfile.id,
+    } as any)
+
+    expect(applied?.id).toBe(activeProfile.id)
+    expect(process.env.OPENAI_BASE_URL).toBe('https://api.hicap.ai/v1')
+    expect(process.env.OPENAI_MODEL).toBe('gpt-5.4')
+    const saved = getProviderProfiles({
+      providerProfiles: [activeProfile],
+      activeProviderProfileId: activeProfile.id,
+    } as any).find((profile: ProviderProfile) => profile.id === activeProfile.id)
+    expect(saved?.model).toBe('glm-5.2')
+  })
+
+  test('cold start on the Anthropic sentinel stays on built-in Anthropic and does not fall back to the OpenGateway default (#1429)', async () => {
+    // Regression: after clearActiveProviderProfile() records the Anthropic
+    // sentinel and deletes the startup profile mirror, a restart must keep the
+    // user on built-in Anthropic. Previously applyActiveProviderProfileFromConfig()
+    // returned without marking provider env as handled (the sentinel resolves to
+    // no profile), so buildStartupEnvFromProfile() saw the missing mirror as a
+    // fresh install and synthesized the default Gitlawb OpenGateway env —
+    // silently moving the user back onto a third-party provider.
+    const { applyActiveProviderProfileFromConfig, ANTHROPIC_DEFAULT_PROFILE_ID } =
+      await importFreshProviderProfileModules()
+    const { buildStartupEnvFromProfile, DEFAULT_STARTUP_PROVIDER_ENV_VAR } =
+      await import(`./providerProfile.js?ts=${Date.now()}-${Math.random()}`)
+
+    // Cold start with a fully isolated env. applyActiveProviderProfileFromConfig
+    // and buildStartupEnvFromProfile treat ANY CLAUDE_CODE_USE_* flag (OpenAI,
+    // GitHub, Gemini, Mistral, Bedrock, Vertex, Foundry) as an explicit provider
+    // selection, so an inherited flag would route this case down a different
+    // path and hide the sentinel regression. Snapshot every provider key, clear
+    // them all, and restore in finally so the test neither leaks nor depends on
+    // ambient env.
+    const providerEnvKeys = [
+      'CLAUDE_CODE_USE_OPENAI',
+      'CLAUDE_CODE_USE_GITHUB',
+      'CLAUDE_CODE_USE_GEMINI',
+      'CLAUDE_CODE_USE_MISTRAL',
+      'CLAUDE_CODE_USE_BEDROCK',
+      'CLAUDE_CODE_USE_VERTEX',
+      'CLAUDE_CODE_USE_FOUNDRY',
+      'OPENAI_BASE_URL',
+      'OPENAI_MODEL',
+      'CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED',
+      'CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID',
+    ]
+    const providerEnvSnapshot = new Map(
+      providerEnvKeys.map(key => [key, process.env[key]] as const),
+    )
+    for (const key of providerEnvKeys) {
+      delete process.env[key]
+    }
+
+    try {
+      const applied = applyActiveProviderProfileFromConfig({
+        providerProfiles: [
+          buildProfile({
+            id: 'saved_openai',
+            baseUrl: 'https://api.openai.com/v1',
+            model: 'gpt-4o',
+          }),
+        ],
+        activeProviderProfileId: ANTHROPIC_DEFAULT_PROFILE_ID,
+      } as any)
+
+      // Built-in Anthropic resolves to no profile, but env is now marked handled
+      // and carries no third-party provider selection.
+      expect(applied).toBeUndefined()
+      expect(String(process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED)).toBe('1')
+      expect(process.env.OPENAI_BASE_URL).toBeUndefined()
+      expect(process.env.CLAUDE_CODE_USE_OPENAI).toBeUndefined()
+
+      // The deleted profile mirror (persisted: null) must NOT be treated as a
+      // fresh install, so no OpenGateway default is synthesized.
+      const startupEnv = await buildStartupEnvFromProfile({
+        persisted: null,
+        processEnv: process.env,
+      })
+      expect(startupEnv[DEFAULT_STARTUP_PROVIDER_ENV_VAR]).not.toBe(
+        'gitlawb-opengateway',
+      )
+      expect(startupEnv.CLAUDE_CODE_USE_OPENAI).toBeUndefined()
+      expect(startupEnv.OPENAI_BASE_URL).toBeUndefined()
+    } finally {
+      for (const [key, value] of providerEnvSnapshot) {
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
   })
 })
 
@@ -1679,7 +2295,7 @@ describe('getProviderPresetDefaults', () => {
 
     expect(defaults.name).toBe('Moonshot AI - API')
     expect(defaults.baseUrl).toBe('https://api.moonshot.ai/v1')
-    expect(defaults.model).toBe('kimi-k2.5')
+    expect(defaults.model).toBe('kimi-k2.7-code')
   })
   test('deepseek preset defaults to DeepSeek V4 Pro', async () => {
     const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
@@ -1702,7 +2318,7 @@ describe('getProviderPresetDefaults', () => {
     expect(defaults.provider).toBe('hicap')
     expect(defaults.name).toBe('Hicap')
     expect(defaults.baseUrl).toBe('https://api.hicap.ai/v1')
-    expect(defaults.model).toBe('claude-opus-4.7')
+    expect(defaults.model).toBe('claude-opus-4.8')
     expect(defaults.apiKey).toBe('hicap-live-key')
     expect(defaults.requiresApiKey).toBe(true)
   })
@@ -1760,6 +2376,20 @@ describe('getProviderPresetDefaults', () => {
     )
     expect(defaults.model).toBe('mimo-v2.5-pro')
     expect(defaults.apiKey).toBe('tp-live-key')
+    expect(defaults.requiresApiKey).toBe(true)
+  })
+
+  test('aimlapi preset defaults to the official AI/ML API endpoint', async () => {
+    const { getProviderPresetDefaults } = await importFreshProviderProfileModules()
+    process.env.AIMLAPI_API_KEY = 'aimlapi-live-key'
+
+    const defaults = getProviderPresetDefaults('aimlapi')
+
+    expect(defaults.provider).toBe('aimlapi')
+    expect(defaults.name).toBe('AI/ML API')
+    expect(defaults.baseUrl).toBe('https://api.aimlapi.com/v1')
+    expect(defaults.model).toBe('gpt-4o')
+    expect(defaults.apiKey).toBe('aimlapi-live-key')
     expect(defaults.requiresApiKey).toBe(true)
   })
 
@@ -2174,6 +2804,136 @@ describe('setActiveProviderProfile', () => {
     }
   })
 
+  test('persists ClinePass profiles using a legacy-compatible openai startup profile', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const clinePassProfile = buildClinePassProfile({
+        id: 'clinepass_prof',
+        model: 'cline-pass/deepseek-v4-flash, cline-pass/qwen3.7-max',
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [clinePassProfile],
+      }))
+
+      const result = setActiveProviderProfile('clinepass_prof', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('clinepass_prof')
+      expect(existsSync(join(tempDir, '.openclaude-profile.json'))).toBe(false)
+      expect(persisted.profile).toBe('openai')
+      expect(persisted.env).toEqual({
+        OPENAI_BASE_URL: 'https://api.cline.bot/api/v1',
+        OPENAI_MODEL: 'cline-pass/deepseek-v4-flash',
+        OPENAI_API_KEY: 'cline-test-key',
+        CLINE_API_KEY: 'cline-test-key',
+      })
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('persists ClinePass profiles with custom base URL using the same dedicated credential', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const clinePassProfile = buildProfile({
+        provider: 'clinepass',
+        name: 'ClinePass Custom',
+        baseUrl: 'https://custom.cline.bot/v1',
+        model: 'cline-pass/qwen3.7-max',
+        apiKey: 'custom-cline-key',
+        id: 'clinepass_custom',
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [clinePassProfile],
+      }))
+
+      const result = setActiveProviderProfile('clinepass_custom', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('clinepass_custom')
+      expect(existsSync(join(tempDir, '.openclaude-profile.json'))).toBe(false)
+      expect(persisted.profile).toBe('openai')
+      expect(persisted.env).toEqual({
+        OPENAI_BASE_URL: 'https://custom.cline.bot/v1',
+        OPENAI_MODEL: 'cline-pass/qwen3.7-max',
+        OPENAI_API_KEY: 'custom-cline-key',
+        CLINE_API_KEY: 'custom-cline-key',
+      })
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('persists Cloudflare profiles with CLOUDFLARE_API_TOKEN in the strict startup env', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const cloudflareProfile = buildCloudflareProfile({ id: 'cloudflare_prof' })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [cloudflareProfile],
+      }))
+
+      const result = setActiveProviderProfile('cloudflare_prof', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('cloudflare_prof')
+      expect(persisted.profile).toBe('openai')
+      // The strict startup-env branch (keyed profile) must mirror the dedicated
+      // token, otherwise a relaunched Cloudflare profile persists an env that
+      // omits CLOUDFLARE_API_TOKEN and re-detects inconsistently.
+      expect(persisted.env).toEqual({
+        OPENAI_BASE_URL:
+          'https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1',
+        OPENAI_MODEL: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+        OPENAI_API_KEY: 'cloudflare-test-token',
+        CLOUDFLARE_API_TOKEN: 'cloudflare-test-token',
+      })
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
   test('persists Xiaomi MiMo profiles using a legacy-compatible openai startup profile', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
     const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
@@ -2210,6 +2970,177 @@ describe('setActiveProviderProfile', () => {
         OPENAI_API_KEY: 'mimo-test-key',
         MIMO_API_KEY: 'mimo-test-key',
       })
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('persists AI/ML API profiles using a legacy-compatible openai startup profile', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const aimlapiProfile = buildProfile({
+        id: 'aimlapi_prof',
+        name: 'AI/ML API',
+        provider: 'aimlapi',
+        baseUrl: 'https://api.aimlapi.com/v1',
+        model: 'gpt-4o',
+        apiKey: 'aimlapi-test-key',
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [aimlapiProfile],
+      }))
+
+      const result = setActiveProviderProfile('aimlapi_prof', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('aimlapi_prof')
+      expect(existsSync(join(tempDir, '.openclaude-profile.json'))).toBe(false)
+      expect(persisted.profile).toBe('openai')
+      expect(persisted.env).toEqual({
+        AIMLAPI_API_KEY: 'aimlapi-test-key',
+        CLAUDE_CODE_PROVIDER_ROUTE_ID: 'aimlapi',
+        OPENAI_BASE_URL: 'https://api.aimlapi.com/v1',
+        OPENAI_MODEL: 'gpt-4o',
+        OPENAI_API_KEY: 'aimlapi-test-key',
+      })
+
+      const { buildStartupEnvFromProfile } = await import(
+        `./providerProfile.js?ts=${Date.now()}-${Math.random()}`
+      )
+      const startupEnv = await buildStartupEnvFromProfile({
+        persisted,
+        processEnv: {},
+      })
+
+      expect(startupEnv.OPENAI_API_KEY).toBe('aimlapi-test-key')
+      expect(startupEnv.AIMLAPI_API_KEY).toBe('aimlapi-test-key')
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('custom (proxy) AI/ML API profiles preserve AIMLAPI startup identity', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const aimlapiProxyProfile = buildProfile({
+        id: 'aimlapi_proxy_prof',
+        name: 'AI/ML API Proxy',
+        provider: 'aimlapi',
+        baseUrl: 'https://proxy.example.com/v1',
+        model: 'gpt-4o',
+        apiKey: 'aimlapi-test-key',
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [aimlapiProxyProfile],
+      }))
+
+      const result = setActiveProviderProfile('aimlapi_proxy_prof', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(result?.id).toBe('aimlapi_proxy_prof')
+      expect(persisted.profile).toBe('openai')
+      expect(persisted.env).toMatchObject({
+        AIMLAPI_API_KEY: 'aimlapi-test-key',
+        CLAUDE_CODE_PROVIDER_ROUTE_ID: 'aimlapi',
+        OPENAI_BASE_URL: 'https://proxy.example.com/v1',
+        OPENAI_MODEL: 'gpt-4o',
+        OPENAI_API_KEY: 'aimlapi-test-key',
+      })
+
+      const { buildStartupEnvFromProfile } = await import(
+        `./providerProfile.js?ts=${Date.now()}-${Math.random()}`
+      )
+      const startupEnv = await buildStartupEnvFromProfile({
+        persisted,
+        processEnv: {},
+      })
+
+      expect(startupEnv.OPENAI_API_KEY).toBe('aimlapi-test-key')
+      expect(startupEnv.AIMLAPI_API_KEY).toBe('aimlapi-test-key')
+      expect(startupEnv.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('aimlapi')
+    } finally {
+      process.chdir(originalCwd)
+      rmSync(tempDir, { recursive: true, force: true })
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('keyless custom (proxy) AI/ML API profiles preserve AIMLAPI route identity', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-'))
+    const configDir = mkdtempSync(join(tmpdir(), 'openclaude-provider-config-'))
+    process.chdir(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = configDir
+
+    try {
+      const { setActiveProviderProfile } =
+        await importFreshProviderProfileModules()
+      const aimlapiProxyProfile = buildProfile({
+        id: 'aimlapi_proxy_prof',
+        name: 'AI/ML API Proxy',
+        provider: 'aimlapi',
+        baseUrl: 'https://proxy.example.com/v1',
+        model: 'gpt-4o',
+      })
+
+      saveMockGlobalConfig(current => ({
+        ...current,
+        providerProfiles: [aimlapiProxyProfile],
+      }))
+
+      setActiveProviderProfile('aimlapi_proxy_prof', {
+        configDir,
+      })
+      const persisted = JSON.parse(
+        readFileSync(join(configDir, '.openclaude-profile.json'), 'utf8'),
+      )
+
+      expect(persisted.profile).toBe('openai')
+      expect(persisted.env).toEqual({
+        CLAUDE_CODE_PROVIDER_ROUTE_ID: 'aimlapi',
+        OPENAI_BASE_URL: 'https://proxy.example.com/v1',
+        OPENAI_MODEL: 'gpt-4o',
+      })
+
+      const { buildStartupEnvFromProfile } = await import(
+        `./providerProfile.js?ts=${Date.now()}-${Math.random()}`
+      )
+      const startupEnv = await buildStartupEnvFromProfile({
+        persisted,
+        processEnv: {
+          AIMLAPI_API_KEY: 'ambient-aimlapi-key',
+        },
+      })
+
+      expect(startupEnv.AIMLAPI_API_KEY).toBe('ambient-aimlapi-key')
+      expect(startupEnv.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('aimlapi')
     } finally {
       process.chdir(originalCwd)
       rmSync(tempDir, { recursive: true, force: true })

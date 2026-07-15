@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { acquireSharedMutationLock, releaseSharedMutationLock } from '../../test/sharedMutationLock.js'
+import {
+  _clearRegistryForTesting,
+  ensureIntegrationsLoaded,
+  registerGateway,
+} from '../../integrations/index.js'
+import { publicBuildVersion } from '../../utils/version.js'
 import { getAnthropicClient } from './client.js'
 
 type FetchType = typeof globalThis.fetch
@@ -41,6 +47,7 @@ const originalEnv = {
   MIMO_API_KEY: process.env.MIMO_API_KEY,
   VENICE_API_KEY: process.env.VENICE_API_KEY,
   FIREWORKS_API_KEY: process.env.FIREWORKS_API_KEY,
+  AIMLAPI_API_KEY: process.env.AIMLAPI_API_KEY,
   NVIDIA_NIM: process.env.NVIDIA_NIM,
   NVIDIA_API_KEY: process.env.NVIDIA_API_KEY,
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
@@ -90,6 +97,7 @@ function clearEnvForMiniMaxOnlyTest(): void {
   delete process.env.MIMO_API_KEY
   delete process.env.VENICE_API_KEY
   delete process.env.FIREWORKS_API_KEY
+  delete process.env.AIMLAPI_API_KEY
   delete process.env.NVIDIA_NIM
   delete process.env.NVIDIA_API_KEY
   delete process.env.ANTHROPIC_API_KEY
@@ -126,6 +134,7 @@ beforeEach(async () => {
   delete process.env.MIMO_API_KEY
   delete process.env.VENICE_API_KEY
   delete process.env.FIREWORKS_API_KEY
+  delete process.env.AIMLAPI_API_KEY
   delete process.env.OPENAI_AUTH_HEADER
   delete process.env.OPENAI_AUTH_SCHEME
   delete process.env.OPENAI_AUTH_HEADER_VALUE
@@ -172,6 +181,7 @@ afterEach(() => {
     restoreEnv('MIMO_API_KEY', originalEnv.MIMO_API_KEY)
     restoreEnv('VENICE_API_KEY', originalEnv.VENICE_API_KEY)
     restoreEnv('FIREWORKS_API_KEY', originalEnv.FIREWORKS_API_KEY)
+    restoreEnv('AIMLAPI_API_KEY', originalEnv.AIMLAPI_API_KEY)
     restoreEnv('NVIDIA_NIM', originalEnv.NVIDIA_NIM)
     restoreEnv('NVIDIA_API_KEY', originalEnv.NVIDIA_API_KEY)
     restoreEnv('ANTHROPIC_API_KEY', originalEnv.ANTHROPIC_API_KEY)
@@ -569,6 +579,86 @@ test('env-only MiniMax fallback ignores non-MiniMax base overrides', async () =>
   expect(process.env.OPENAI_MODEL).toBe('MiniMax-M2.7')
 })
 
+test('routes env-only AI/ML API requests through the OpenAI-compatible shim despite an ambient OpenAI key', async () => {
+  let capturedUrl: string | undefined
+  let capturedHeaders: Headers | undefined
+  let capturedBody: Record<string, unknown> | undefined
+
+  delete process.env.CLAUDE_CODE_USE_GEMINI
+  delete process.env.GEMINI_API_KEY
+  delete process.env.GEMINI_MODEL
+  delete process.env.GEMINI_BASE_URL
+  delete process.env.GEMINI_AUTH_MODE
+  process.env.OPENAI_API_KEY = 'ambient-openai-key'
+  process.env.AIMLAPI_API_KEY = 'aimlapi-test-key'
+
+  globalThis.fetch = (async (input, init) => {
+    capturedUrl =
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url
+    capturedHeaders = new Headers(init?.headers)
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-aimlapi',
+        model: 'gpt-4o',
+        choices: [
+          {
+            message: { role: 'assistant', content: 'aimlapi ok' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 8,
+          completion_tokens: 3,
+          total_tokens: 11,
+        },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as FetchType
+
+  const client = (await getAnthropicClient({
+    maxRetries: 0,
+    model: 'gpt-4o',
+  })) as unknown as ShimClient
+
+  const response = await client.beta.messages.create({
+    model: 'gpt-4o',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://api.aimlapi.com/v1/chat/completions')
+  expect(capturedHeaders?.get('authorization')).toBe(
+    'Bearer aimlapi-test-key',
+  )
+  expect(capturedHeaders?.get('x-aimlapi-partner-id')).toBe('part_62yQoGYDq4Yqnrj2R1iGrDNJ')
+  expect(capturedHeaders?.get('x-aimlapi-integration-repo')).toBe(
+    'Gitlawb/openclaude',
+  )
+  expect(capturedHeaders?.get('x-aimlapi-integration-version')).toBe(
+    publicBuildVersion,
+  )
+  expect(capturedHeaders?.get('http-referer')).toBe('OpenClaude')
+  expect(capturedHeaders?.get('x-title')).toBe('OpenClaude')
+  expect(capturedBody?.model).toBe('gpt-4o')
+  expect(process.env.CLAUDE_CODE_USE_OPENAI).toBe('1')
+  expect(process.env.OPENAI_BASE_URL).toBe('https://api.aimlapi.com/v1')
+  expect(process.env.OPENAI_MODEL).toBe('gpt-4o')
+  expect(process.env.OPENAI_API_KEY).toBe('aimlapi-test-key')
+  expect(response).toMatchObject({
+    role: 'assistant',
+    model: 'gpt-4o',
+  })
+})
+
 test('routes env-only xAI requests through the OpenAI-compatible shim', async () => {
   let capturedUrl: string | undefined
   let capturedHeaders: Headers | undefined
@@ -637,7 +727,7 @@ test('routes env-only xAI requests through the OpenAI-compatible shim', async ()
   // cached system prompt and conversation history can be reused. Mirrors the
   // Hermes implementation (RELEASE_v0.8.0 PR #5604).
   expect(capturedHeaders?.get('x-grok-conv-id')).toBeTruthy()
-  expect(capturedBody?.model).toBe('grok-4')
+  expect(capturedBody?.model).toBe('grok-4.3')
   expect(response).toMatchObject({
     role: 'assistant',
     model: 'grok-4',
@@ -1332,6 +1422,420 @@ test('strips Anthropic-specific custom headers on providerOverride shim requests
   expect(capturedHeaders?.get('authorization')).toBe('Bearer provider-test-key')
 })
 
+test('providerOverride OpenAI gpt effort does not fall back to ambient provider', async () => {
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-provider-override-openai',
+        model: 'gpt-5.4',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'ok',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 8,
+          completion_tokens: 3,
+          total_tokens: 11,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = (await getAnthropicClient({
+    maxRetries: 0,
+    effortValue: 'xhigh',
+    providerOverride: {
+      model: 'gpt-5.4',
+      baseURL: 'https://api.openai.com/v1',
+      apiKey: 'provider-test-key',
+    },
+  })) as unknown as ShimClient
+
+  await client.beta.messages.create({
+    model: 'unused',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(requestBody?.reasoning_effort).toBe('xhigh')
+})
+test('providerOverride custom OpenAI-compatible gpt effort uses legacy support', async () => {
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-provider-override-custom-openai',
+        model: 'gpt-5.4',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'ok',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 8,
+          completion_tokens: 3,
+          total_tokens: 11,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = (await getAnthropicClient({
+    maxRetries: 0,
+    effortValue: 'high',
+    providerOverride: {
+      model: 'gpt-5.4',
+      baseURL: 'https://custom-openai-compatible.example.test/v1',
+      apiKey: 'provider-test-key',
+    },
+  })) as unknown as ShimClient
+
+  await client.beta.messages.create({
+    model: 'unused',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(requestBody?.reasoning_effort).toBe('high')
+})
+test('providerOverride clamps stale effort against metadata levels', async () => {
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-provider-override-metadata-clamp',
+        model: 'metadata-high-only-model',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'ok',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 8,
+          completion_tokens: 3,
+          total_tokens: 11,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  _clearRegistryForTesting()
+  try {
+    registerGateway({
+      id: 'metadata-effort-test',
+      label: 'Metadata Effort Test',
+      defaultBaseUrl: 'https://metadata-effort.example.test/v1',
+      setup: { requiresAuth: true, authMode: 'api-key' },
+      transportConfig: { kind: 'openai-compatible' },
+      catalog: {
+        source: 'static',
+        models: [
+          {
+            id: 'metadata-high-only-model',
+            apiName: 'metadata-high-only-model',
+            capabilities: { supportsReasoning: true },
+            reasoning: {
+              mode: 'levels',
+              levels: ['high'],
+              wireFormat: 'reasoning_effort',
+            },
+          },
+        ],
+      },
+    })
+
+    const client = (await getAnthropicClient({
+      maxRetries: 0,
+      effortValue: 'low',
+      providerOverride: {
+        model: 'metadata-high-only-model',
+        baseURL: 'https://metadata-effort.example.test/v1',
+        apiKey: 'provider-test-key',
+      },
+    })) as unknown as ShimClient
+
+    await client.beta.messages.create({
+      model: 'unused',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    })
+  } finally {
+    _clearRegistryForTesting()
+    ensureIntegrationsLoaded()
+  }
+
+  expect(requestBody?.reasoning_effort).toBe('high')
+})
+test('providerOverride Atlas Kimi metadata emits top-level reasoning_effort and clamps unsupported levels', async () => {
+  let requestBody: Record<string, unknown> | undefined
+  const originalFetch = globalThis.fetch
+
+  try {
+    globalThis.fetch = (async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body))
+
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl-provider-override-atlas-kimi',
+          model: 'moonshotai/kimi-k2.7-code',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: 'ok',
+              },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: {
+            prompt_tokens: 8,
+            completion_tokens: 3,
+            total_tokens: 11,
+          },
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        },
+      )
+    }) as FetchType
+
+    const client = (await getAnthropicClient({
+      maxRetries: 0,
+      effortValue: 'xhigh',
+      providerOverride: {
+        model: 'moonshotai/kimi-k2.7-code',
+        baseURL: 'https://api.atlascloud.ai/v1',
+        apiKey: 'atlas-test-key',
+      },
+    })) as unknown as ShimClient
+
+    await client.beta.messages.create({
+      model: 'unused',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    })
+
+    expect(requestBody?.reasoning_effort).toBe('high')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('providerOverride Kimi Code clamps unsupported xhigh effort to high', async () => {
+  let requestBody: Record<string, unknown> | undefined
+  const originalFetch = globalThis.fetch
+
+  try {
+    globalThis.fetch = (async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body))
+
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl-provider-override-kimi-code',
+          model: 'kimi-for-coding',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: 'ok',
+              },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: {
+            prompt_tokens: 8,
+            completion_tokens: 3,
+            total_tokens: 11,
+          },
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        },
+      )
+    }) as FetchType
+
+    const client = (await getAnthropicClient({
+      maxRetries: 0,
+      effortValue: 'xhigh',
+      providerOverride: {
+        model: 'kimi-for-coding',
+        baseURL: 'https://api.kimi.com/coding/v1',
+        apiKey: 'kimi-test-key',
+      },
+    })) as unknown as ShimClient
+
+    await client.beta.messages.create({
+      model: 'unused',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    })
+
+    expect(requestBody?.reasoning_effort).toBe('high')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+test('providerOverride Atlas Grok Build does not send reasoning effort', async () => {
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-provider-override-atlas-grok-build',
+        model: 'xai/grok-build-0.1',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'ok',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 8,
+          completion_tokens: 3,
+          total_tokens: 11,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = (await getAnthropicClient({
+    maxRetries: 0,
+    effortValue: 'high',
+    providerOverride: {
+      model: 'xai/grok-build-0.1',
+      baseURL: 'https://api.atlascloud.ai/v1',
+      apiKey: 'atlas-test-key',
+    },
+  })) as unknown as ShimClient
+
+  await client.beta.messages.create({
+    model: 'unused',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(requestBody?.reasoning_effort).toBeUndefined()
+})
+test('providerOverride Groq DeepSeek does not receive stripped effort override', async () => {
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-provider-override-groq',
+        model: 'deepseek-r1-distill-llama-70b',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'ok',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 8,
+          completion_tokens: 3,
+          total_tokens: 11,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = (await getAnthropicClient({
+    maxRetries: 0,
+    effortValue: 'xhigh',
+    providerOverride: {
+      model: 'deepseek-r1-distill-llama-70b',
+      baseURL: 'https://api.groq.com/openai/v1',
+      apiKey: 'provider-test-key',
+    },
+  })) as unknown as ShimClient
+
+  await client.beta.messages.create({
+    model: 'unused',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+    thinking: { type: 'enabled' },
+  })
+
+  expect(requestBody?.thinking).toEqual({ type: 'enabled' })
+  expect(requestBody?.reasoning_effort).toBeUndefined()
+  expect(requestBody?.store).toBeUndefined()
+})
 test('rejects CRLF-injected custom headers before sending OpenAI-compatible shim requests', async () => {
   let capturedHeaders: Headers | undefined
 

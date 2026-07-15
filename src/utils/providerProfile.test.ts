@@ -274,6 +274,85 @@ test('openai launch prefers a live dedicated vendor key over the persisted one',
   assert.equal(env.ATLAS_CLOUD_API_KEY, 'atlas-rotated-key')
 })
 
+test('openai launch carries AIMLAPI_API_KEY only when the route resolves to aimlapi', async () => {
+  // Ambient/persisted AIMLAPI_API_KEY must not leak into an unrelated OpenAI
+  // route — AI/ML API authenticates via OPENAI_API_KEY there.
+  const offRoute = await buildLaunchEnv({
+    profile: 'openai',
+    persisted: profile('openai', {
+      OPENAI_BASE_URL: 'https://api.openai.com/v1',
+      OPENAI_API_KEY: 'sk-openai',
+      AIMLAPI_API_KEY: 'aimlapi-persisted',
+    }),
+    goal: 'coding',
+    processEnv: {
+      AIMLAPI_API_KEY: 'aimlapi-ambient',
+    },
+  })
+
+  assert.equal(offRoute.AIMLAPI_API_KEY, undefined)
+
+  // On the aimlapi route the dedicated key is carried like other providers.
+  const onRoute = await buildLaunchEnv({
+    profile: 'openai',
+    persisted: profile('openai', {
+      OPENAI_BASE_URL: 'https://api.aimlapi.com/v1',
+      OPENAI_MODEL: 'gpt-4o',
+      OPENAI_API_KEY: 'aimlapi-key',
+      AIMLAPI_API_KEY: 'aimlapi-key',
+    }),
+    goal: 'coding',
+    processEnv: {},
+  })
+
+  assert.equal(onRoute.AIMLAPI_API_KEY, 'aimlapi-key')
+})
+
+test('openai launch mirrors rotated OPENAI_API_KEY into AIMLAPI_API_KEY on aimlapi route', async () => {
+  const env = await buildLaunchEnv({
+    profile: 'openai',
+    persisted: profile('openai', {
+      OPENAI_BASE_URL: 'https://api.aimlapi.com/v1',
+      OPENAI_MODEL: 'gpt-4o',
+      OPENAI_API_KEY: 'old-openai-key',
+      AIMLAPI_API_KEY: 'old-aimlapi-key',
+    }),
+    goal: 'coding',
+    processEnv: {
+      OPENAI_API_KEY: 'rotated-openai-key',
+    },
+  })
+
+  assert.equal(env.OPENAI_API_KEY, 'rotated-openai-key')
+  assert.equal(env.AIMLAPI_API_KEY, 'rotated-openai-key')
+})
+
+test('openai launch lets live base URL override persisted AIMLAPI route marker', async () => {
+  const env = await buildLaunchEnv({
+    profile: 'openai',
+    persisted: profile('openai', {
+      CLAUDE_CODE_PROVIDER_ROUTE_ID: 'aimlapi',
+      OPENAI_BASE_URL: 'https://proxy.example.com/v1',
+      OPENAI_MODEL: 'gpt-4o',
+      OPENAI_API_KEY: 'persisted-aimlapi-key',
+      AIMLAPI_API_KEY: 'persisted-aimlapi-key',
+    }),
+    goal: 'coding',
+    processEnv: {
+      OPENAI_BASE_URL: 'https://api.openai.com/v1',
+      OPENAI_API_KEY: 'live-openai-key',
+      AIMLAPI_API_KEY: 'ambient-aimlapi-key',
+    },
+  })
+
+  assert.equal(env.OPENAI_BASE_URL, 'https://api.openai.com/v1')
+  assert.equal(env.OPENAI_API_KEY, 'live-openai-key')
+  assert.equal(env.AIMLAPI_API_KEY, undefined)
+  // The stale aimlapi route marker must be cleared entirely, not just
+  // swapped to a different route value.
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, undefined)
+})
+
 test('xai launch uses descriptor defaults and persisted xAI key', async () => {
   const env = await buildLaunchEnv({
     profile: 'xai',
@@ -425,6 +504,121 @@ test('buildStartupEnvFromProfile preserves explicit OpenAI-compatible env withou
   assert.equal(env.OPENAI_BASE_URL, 'http://common.example.com/v1')
   assert.equal(env.OPENAI_MODEL, 'gemma-4-31B-it')
   assert.equal(resolveActiveRouteIdFromEnv(env), 'custom')
+  assert.equal(isDefaultStartupProviderEnv(env), false)
+})
+
+test('buildStartupEnvFromProfile preserves concrete env-only NIM setup over stale profile', async () => {
+  const processEnv = {
+    OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+    OPENAI_MODEL: 'qwen/qwen3.5-397b-a17b',
+    NVIDIA_API_KEY: 'nvapi-live',
+    NVIDIA_NIM: '1',
+  }
+
+  const env = await buildStartupEnvFromProfile({
+    persisted: profile('openai', {
+      OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+      OPENAI_MODEL: 'z-ai/glm-5.2',
+      NVIDIA_API_KEY: 'nvapi-stale',
+      NVIDIA_NIM: '1',
+    }),
+    processEnv,
+  })
+
+  assert.notEqual(env, processEnv)
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '1')
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, 'nvidia-nim')
+  assert.equal(env.OPENAI_MODEL, 'qwen/qwen3.5-397b-a17b')
+  assert.equal(env.OPENAI_BASE_URL, 'https://integrate.api.nvidia.com/v1')
+  assert.equal(env.NVIDIA_API_KEY, 'nvapi-live')
+  assert.equal(env.NVIDIA_NIM, '1')
+  assert.equal(resolveActiveRouteIdFromEnv(env), 'nvidia-nim')
+})
+
+test('buildStartupEnvFromProfile does not activate non-NIM env-only OpenAI-compatible setup', async () => {
+  const env = await buildStartupEnvFromProfile({
+    persisted: null,
+    processEnv: {
+      OPENAI_BASE_URL: 'https://openrouter.ai/api/v1',
+      OPENAI_MODEL: 'openrouter/zhipu/glm-5.2',
+      OPENAI_API_KEY: 'sk-live',
+    },
+  })
+
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '1')
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, undefined)
+  assert.equal(env.OPENAI_BASE_URL, 'https://opengateway.gitlawb.com/v1')
+  assert.equal(env.OPENAI_MODEL, 'mimo-v2.5-pro')
+  assert.equal(env.OPENAI_API_KEY, undefined)
+  assert.equal(resolveActiveRouteIdFromEnv(env), 'gitlawb-opengateway')
+  assert.equal(isDefaultStartupProviderEnv(env), true)
+})
+
+test('buildStartupEnvFromProfile documents no-flag Gemini env does not beat concrete NIM setup', async () => {
+  const processEnv = {
+    GEMINI_API_KEY: 'gemini-live',
+    GEMINI_MODEL: 'gemini-2.5-flash',
+    OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+    OPENAI_MODEL: 'qwen/qwen3.5-397b-a17b',
+    NVIDIA_API_KEY: 'nvapi-live',
+    NVIDIA_NIM: '1',
+  }
+
+  const env = await buildStartupEnvFromProfile({
+    persisted: null,
+    processEnv,
+  })
+
+  assert.notEqual(env, processEnv)
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '1')
+  assert.equal(env.CLAUDE_CODE_USE_GEMINI, undefined)
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, 'nvidia-nim')
+  assert.equal(env.GEMINI_API_KEY, undefined)
+  assert.equal(env.OPENAI_MODEL, 'qwen/qwen3.5-397b-a17b')
+  assert.equal(resolveActiveRouteIdFromEnv(env), 'nvidia-nim')
+})
+
+test('buildStartupEnvFromProfile preserves explicit OpenAI opt-out over concrete env-only NIM setup', async () => {
+  const processEnv: NodeJS.ProcessEnv = {
+    CLAUDE_CODE_USE_OPENAI: '0',
+    OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+    OPENAI_MODEL: 'qwen/qwen3.5-397b-a17b',
+    NVIDIA_API_KEY: 'nvapi-live',
+    NVIDIA_NIM: '1',
+  }
+
+  const env = await buildStartupEnvFromProfile({
+    persisted: null,
+    processEnv,
+  })
+
+  assert.equal(env, processEnv)
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '0')
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, undefined)
+  assert.equal(isDefaultStartupProviderEnv(env), false)
+})
+
+test('buildStartupEnvFromProfile preserves explicit Gemini selection over concrete env-only NIM setup', async () => {
+  const processEnv: NodeJS.ProcessEnv = {
+    CLAUDE_CODE_USE_GEMINI: '1',
+    GEMINI_API_KEY: 'gemini-live',
+    GEMINI_MODEL: 'gemini-2.5-flash',
+    OPENAI_BASE_URL: 'https://integrate.api.nvidia.com/v1',
+    OPENAI_MODEL: 'qwen/qwen3.5-397b-a17b',
+    NVIDIA_API_KEY: 'nvapi-live',
+    NVIDIA_NIM: '1',
+  }
+
+  const env = await buildStartupEnvFromProfile({
+    persisted: null,
+    processEnv,
+  })
+
+  assert.equal(env, processEnv)
+  assert.equal(env.CLAUDE_CODE_USE_GEMINI, '1')
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, undefined)
+  assert.equal(env.CLAUDE_CODE_PROVIDER_ROUTE_ID, undefined)
+  assert.equal(resolveActiveRouteIdFromEnv(env), 'gemini')
   assert.equal(isDefaultStartupProviderEnv(env), false)
 })
 
@@ -917,7 +1111,7 @@ test('saveProfileFile writes a profile that loadProfileFile can read back', () =
   }
 })
 
-test('saveProfileFile defaults to user config instead of the working directory', () => {
+test('saveProfileFile defaults to user config instead of the working directory', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-workspace-profile-'))
   const configRoot = mkdtempSync(join(tmpdir(), 'openclaude-config-profile-'))
   const configDir = join(configRoot, 'config')
@@ -956,7 +1150,7 @@ test('saveProfileFile defaults to user config instead of the working directory',
   }
 })
 
-test('loadProfileFile keeps project-local files as a legacy fallback', () => {
+test('loadProfileFile keeps project-local files as a legacy fallback', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-legacy-profile-'))
   const configDir = mkdtempSync(join(tmpdir(), 'openclaude-empty-config-profile-'))
   const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
@@ -989,7 +1183,7 @@ test('loadProfileFile keeps project-local files as a legacy fallback', () => {
   }
 })
 
-test('loadProfileFile does not fall back when user config profile is invalid', () => {
+test('loadProfileFile does not fall back when user config profile is invalid', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-invalid-profile-'))
   const configDir = mkdtempSync(join(tmpdir(), 'openclaude-invalid-config-profile-'))
   const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
@@ -1023,7 +1217,7 @@ test('loadProfileFile does not fall back when user config profile is invalid', (
   }
 })
 
-test('deleteProfileFile clears the default profile and legacy workspace fallback', () => {
+test('deleteProfileFile clears the default profile and legacy workspace fallback', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-delete-profile-'))
   const configDir = mkdtempSync(join(tmpdir(), 'openclaude-delete-config-profile-'))
   const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
