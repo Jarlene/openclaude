@@ -352,7 +352,12 @@ export function getPromptCachingEnabled(model: string): boolean {
   // format, so cache_control blocks are supported.
   const provider = getAPIProvider()
   const isNativeGithub = isGithubNativeAnthropicMode(model)
-  if (provider !== 'firstParty' && provider !== 'bedrock' && provider !== 'vertex' && !isNativeGithub) {
+  if (
+    (provider !== 'firstParty' || !isFirstPartyAnthropicBaseUrl()) &&
+    provider !== 'bedrock' &&
+    provider !== 'vertex' &&
+    !isNativeGithub
+  ) {
     return false
   }
 
@@ -1098,6 +1103,39 @@ export function stripExcessMediaItems(
   }) as (UserMessage | AssistantMessage)[]
 }
 
+/**
+ * Tool-history compression routing for Anthropic-native transports (exported
+ * for focused tests — queryModel itself needs a live client to exercise).
+ * Native transports (first-party, Bedrock, Vertex, GitHub-native-Anthropic)
+ * compress only while prompt caching is inactive: retroactive tier rewrites
+ * diverge the cached request prefix and cost more than they save. Requests
+ * carrying a per-agent providerOverride are shim-routed and compress at the
+ * shim layer instead.
+ */
+export function shouldCompressNativeToolHistory(options: {
+  apiProvider: string
+  // firstParty alone is not enough: a custom ANTHROPIC_BASE_URL (proxy /
+  // compatible endpoint) also reports firstParty, but getPromptCachingEnabled
+  // already returns false there — treating it as native would compress every
+  // request against an endpoint we make no assumptions about. Mirror the
+  // same base-URL guard prompt caching itself uses.
+  isFirstPartyBaseUrl: boolean
+  isGithubNativeAnthropic: boolean
+  hasProviderOverride: boolean
+  promptCachingEnabled: boolean
+}): boolean {
+  const isNativeTransport =
+    (options.apiProvider === 'firstParty' && options.isFirstPartyBaseUrl) ||
+    options.apiProvider === 'bedrock' ||
+    options.apiProvider === 'vertex' ||
+    options.isGithubNativeAnthropic
+  return (
+    isNativeTransport &&
+    !options.hasProviderOverride &&
+    !options.promptCachingEnabled
+  )
+}
+
 async function* queryModel(
   messages: Message[],
   systemPrompt: SystemPrompt,
@@ -1113,6 +1151,7 @@ async function* queryModel(
   // init (~10ms). For non-Opus models (haiku, sonnet) this skips the await
   // entirely. Subscribers don't hit this path at all.
   if (
+    isFirstPartyAnthropicBaseUrl() &&
     !isClaudeAISubscriber() &&
     isNonCustomOpusModel(options.model) &&
     (
@@ -1340,6 +1379,32 @@ async function* queryModel(
 
   queryCheckpoint('query_tool_schema_build_end')
 
+  // Compress old tool outputs for Anthropic-native transports, but only when
+  // prompt caching is inactive. Rewriting old messages as they cross tier
+  // boundaries diverges the request prefix on every call, which breaks the
+  // prompt cache and costs more than the compression saves — cached native
+  // sessions rely on microCompact (cache-aware) instead. Shim-routed traffic
+  // (OpenAI-compatible env providers, per-agent providerOverride, Codex)
+  // compresses at its own layer, where the local fast-path opt-out applies.
+  // compressToolHistory is generic over AnyMessage — cast to satisfy the type
+  // checker since OpenClaude's Message union is a superset of what the
+  // function actually inspects.
+  const compressNativeToolHistory = shouldCompressNativeToolHistory({
+    apiProvider: getAPIProvider(),
+    isFirstPartyBaseUrl: isFirstPartyAnthropicBaseUrl(),
+    isGithubNativeAnthropic: isGithubNativeAnthropicMode(options.model),
+    hasProviderOverride: Boolean(options.providerOverride),
+    promptCachingEnabled: getPromptCachingEnabled(options.model),
+  })
+  if (compressNativeToolHistory) {
+    const { compressToolHistory } = await import('./compressToolHistory.js')
+    messages = compressToolHistory(
+      messages as unknown as Parameters<typeof compressToolHistory>[0],
+      options.model,
+      { effectiveContextWindowSize: getContextWindowForModel(options.model, getSdkBetas()) },
+    ) as typeof messages
+  }
+
   // Normalize messages before building system prompt (needed for fingerprinting)
   // Instrumentation: Track message count before normalization
   logEvent('tengu_api_before_normalize', {
@@ -1544,6 +1609,7 @@ async function* queryModel(
       !cacheEditingHeaderLatched &&
       cachedMCEnabled &&
       getAPIProvider() === 'firstParty' &&
+      isFirstPartyAnthropicBaseUrl() &&
       options.querySource === 'repl_main_thread'
     ) {
       cacheEditingHeaderLatched = true
@@ -1783,10 +1849,12 @@ async function* queryModel(
     const useCachedMC =
       cachedMCEnabled &&
       getAPIProvider() === 'firstParty' &&
+      isFirstPartyAnthropicBaseUrl() &&
       options.querySource === 'repl_main_thread'
     if (
       cacheEditingHeaderLatched &&
       getAPIProvider() === 'firstParty' &&
+      isFirstPartyAnthropicBaseUrl() &&
       options.querySource === 'repl_main_thread' &&
       !betasParams.includes(cacheEditingBetaHeader)
     ) {

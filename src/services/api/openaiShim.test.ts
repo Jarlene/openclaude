@@ -1,5 +1,6 @@
 import { APIError } from '@anthropic-ai/sdk'
 import { afterEach, beforeEach, expect, mock, test } from 'bun:test'
+import { getEventListeners } from 'node:events'
 import { acquireSharedMutationLock, releaseSharedMutationLock } from '../../test/sharedMutationLock.js'
 import { asMockFetch } from '../../test/typedMocks.js'
 import { _clearRegistryForTesting, ensureIntegrationsLoaded, registerGateway } from '../../integrations/index.ts'
@@ -9,6 +10,10 @@ import {
   getAssistantMessageFromError,
   OPENCODE_GO_FREE_LIMIT_ERROR_MESSAGE,
 } from './errors.ts'
+import {
+  extractOpenAICategoryMarker,
+  isOpenAIRequestNonReplayable,
+} from './openaiErrorClassification.ts'
 import { createOpenAIShimClient, hasMistralApiHost } from './openaiShim.ts'
 import * as realCodexShim from './codexShim.js'
 import * as realGithubModelsCredentials from '../../utils/githubModelsCredentials.js'
@@ -22,6 +27,7 @@ const originalEnv = {
   OPENAI_API_KEYS: process.env.OPENAI_API_KEYS,
   OPENAI_MODEL: process.env.OPENAI_MODEL,
   OPENAI_API_FORMAT: process.env.OPENAI_API_FORMAT,
+  OPENAI_AZURE_STYLE: process.env.OPENAI_AZURE_STYLE,
   OPENAI_AUTH_HEADER: process.env.OPENAI_AUTH_HEADER,
   OPENAI_AUTH_SCHEME: process.env.OPENAI_AUTH_SCHEME,
   OPENAI_AUTH_HEADER_VALUE: process.env.OPENAI_AUTH_HEADER_VALUE,
@@ -49,12 +55,15 @@ const originalEnv = {
   OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
   DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
   MIMO_API_KEY: process.env.MIMO_API_KEY,
+  LONGCAT_API_KEY: process.env.LONGCAT_API_KEY,
+  CLINE_API_KEY: process.env.CLINE_API_KEY,
   OPENGATEWAY_API_KEY: process.env.OPENGATEWAY_API_KEY,
   OPENGATEWAY_BASE_URL: process.env.OPENGATEWAY_BASE_URL,
   OPENCODE_API_KEY: process.env.OPENCODE_API_KEY,
   CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED: process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED,
   CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID: process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID,
   CLAUDE_STREAM_IDLE_TIMEOUT_MS: process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS,
+  API_TIMEOUT_MS: process.env.API_TIMEOUT_MS,
 }
 
 const originalFetch = globalThis.fetch
@@ -363,6 +372,7 @@ function importFreshOpenAIShim(
 
 type StreamIdleTestApi = {
   StreamIdleTimeoutError: new (timeoutMs: number) => Error
+  getApiTimeoutMs: () => number
   getStreamIdleTimeoutMs: () => number
   readWithIdleTimeout: (
     reader: ReadableStreamDefaultReader<Uint8Array>,
@@ -375,6 +385,7 @@ async function getStreamIdleTestApi(cacheKey: string): Promise<StreamIdleTestApi
   const mod = await importFreshOpenAIShim(cacheKey)
   const testApi = mod.__test as unknown as Partial<StreamIdleTestApi>
   expect(typeof testApi.StreamIdleTimeoutError).toBe('function')
+  expect(typeof testApi.getApiTimeoutMs).toBe('function')
   expect(typeof testApi.getStreamIdleTimeoutMs).toBe('function')
   expect(typeof testApi.readWithIdleTimeout).toBe('function')
   return testApi as StreamIdleTestApi
@@ -401,6 +412,48 @@ function makeChatCompletionResponse(model: string): Response {
       },
     },
   )
+}
+
+function makeGithubChatFallbackResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      error: { message: '/chat/completions is not accessible for this model' },
+    }),
+    { status: 400, headers: { 'Content-Type': 'application/json' } },
+  )
+}
+
+function makeResponsesApiResponse(model: string): Response {
+  return new Response(
+    JSON.stringify({
+      id: 'resp-fallback-test',
+      model,
+      output: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'ok' }],
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    }),
+    { headers: { 'Content-Type': 'application/json' } },
+  )
+}
+
+function pendingFetchUntilAbort(
+  init: RequestInit | undefined,
+): Promise<Response> {
+  return new Promise<Response>((_resolve, reject) => {
+    const signal = init?.signal
+    if (!signal) return
+
+    const rejectFromAbort = () => {
+      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+    }
+    signal.addEventListener('abort', rejectFromAbort, { once: true })
+    if (signal.aborted) rejectFromAbort()
+  })
 }
 
 async function captureChatCompletionRequest(
@@ -437,6 +490,7 @@ beforeEach(async () => {
   delete process.env.OPENAI_API_KEYS
   delete process.env.OPENAI_MODEL
   delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
   delete process.env.OPENAI_AUTH_HEADER
   delete process.env.OPENAI_AUTH_SCHEME
   delete process.env.OPENAI_AUTH_HEADER_VALUE
@@ -464,12 +518,15 @@ beforeEach(async () => {
   delete process.env.OPENROUTER_API_KEY
   delete process.env.DEEPSEEK_API_KEY
   delete process.env.MIMO_API_KEY
+  delete process.env.LONGCAT_API_KEY
+  delete process.env.CLINE_API_KEY
   delete process.env.OPENGATEWAY_API_KEY
   delete process.env.OPENGATEWAY_BASE_URL
   delete process.env.OPENCODE_API_KEY
   delete process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED
   delete process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID
   delete process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS
+  delete process.env.API_TIMEOUT_MS
 })
 
 afterEach(() => {
@@ -480,6 +537,7 @@ afterEach(() => {
     restoreEnv('OPENAI_API_KEYS', originalEnv.OPENAI_API_KEYS)
     restoreEnv('OPENAI_MODEL', originalEnv.OPENAI_MODEL)
     restoreEnv('OPENAI_API_FORMAT', originalEnv.OPENAI_API_FORMAT)
+    restoreEnv('OPENAI_AZURE_STYLE', originalEnv.OPENAI_AZURE_STYLE)
     restoreEnv('OPENAI_AUTH_HEADER', originalEnv.OPENAI_AUTH_HEADER)
     restoreEnv('OPENAI_AUTH_SCHEME', originalEnv.OPENAI_AUTH_SCHEME)
     restoreEnv('OPENAI_AUTH_HEADER_VALUE', originalEnv.OPENAI_AUTH_HEADER_VALUE)
@@ -507,12 +565,15 @@ afterEach(() => {
     restoreEnv('OPENROUTER_API_KEY', originalEnv.OPENROUTER_API_KEY)
     restoreEnv('DEEPSEEK_API_KEY', originalEnv.DEEPSEEK_API_KEY)
     restoreEnv('MIMO_API_KEY', originalEnv.MIMO_API_KEY)
+    restoreEnv('LONGCAT_API_KEY', originalEnv.LONGCAT_API_KEY)
+    restoreEnv('CLINE_API_KEY', originalEnv.CLINE_API_KEY)
     restoreEnv('OPENGATEWAY_API_KEY', originalEnv.OPENGATEWAY_API_KEY)
     restoreEnv('OPENGATEWAY_BASE_URL', originalEnv.OPENGATEWAY_BASE_URL)
     restoreEnv('OPENCODE_API_KEY', originalEnv.OPENCODE_API_KEY)
     restoreEnv('CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED', originalEnv.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED)
     restoreEnv('CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID', originalEnv.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID)
     restoreEnv('CLAUDE_STREAM_IDLE_TIMEOUT_MS', originalEnv.CLAUDE_STREAM_IDLE_TIMEOUT_MS)
+    restoreEnv('API_TIMEOUT_MS', originalEnv.API_TIMEOUT_MS)
     globalThis.fetch = originalFetch
     _clearRegistryForTesting()
     ensureIntegrationsLoaded()
@@ -681,6 +742,572 @@ test('nests reasoning effort for OpenAI-compatible responses endpoint', async ()
   expect(capturedBody?.include).toEqual(['reasoning.encrypted_content'])
   expect(capturedBody).not.toHaveProperty('reasoning_effort')
   expect(capturedBody).not.toHaveProperty('reasoning_summary')
+})
+
+test('auto-routes gpt-5.6 to /responses on api.openai.com with tools and nested reasoning', async () => {
+  // No OPENAI_API_FORMAT set: the model+base predicate must pick responses.
+  process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+  let capturedBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (input, init) => {
+    capturedUrl = String(input)
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+    return new Response(
+      JSON.stringify({
+        id: 'resp-1',
+        model: 'gpt-5.6-sol',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
+          },
+        ],
+        usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({ reasoningEffort: 'high' }) as OpenAIShimClient
+
+  await client.beta.messages.create({
+    model: 'gpt-5.6-sol',
+    messages: [{ role: 'user', content: 'hello' }],
+    tools: [
+      {
+        name: 'get_weather',
+        description: 'Get the weather',
+        input_schema: {
+          type: 'object',
+          properties: { location: { type: 'string' } },
+          required: ['location'],
+        },
+      },
+    ],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://api.openai.com/v1/responses')
+  expect(Array.isArray(capturedBody?.tools)).toBe(true)
+  expect((capturedBody?.tools as unknown[]).length).toBe(1)
+  expect(JSON.stringify(capturedBody?.tools)).toContain('get_weather')
+  expect(capturedBody?.reasoning).toEqual({ effort: 'high', summary: 'auto' })
+  expect(capturedBody).not.toHaveProperty('reasoning_effort')
+})
+
+test('gpt-5.6 chat-completions escape hatch omits reasoning effort with tools', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  process.env.OPENAI_API_FORMAT = 'chat_completions'
+  let capturedUrl = ''
+  let capturedBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (input, init) => {
+    capturedUrl = String(input)
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'gpt-5.6-sol',
+        choices: [
+          { message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+        ],
+        usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({ reasoningEffort: 'high' }) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-5.6-sol',
+    messages: [{ role: 'user', content: 'hello' }],
+    tools: [{
+      name: 'get_weather',
+      description: 'Get the weather',
+      input_schema: { type: 'object', properties: {} },
+    }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://api.openai.com/v1/chat/completions')
+  expect(capturedBody?.tools).toBeDefined()
+  expect(capturedBody).not.toHaveProperty('reasoning_effort')
+})
+
+test('gpt-5.4 chat-completions escape hatch omits reasoning effort with tools', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  process.env.OPENAI_API_FORMAT = 'chat_completions'
+  let capturedBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+    return new Response(JSON.stringify({
+      id: 'chatcmpl-1', model: 'gpt-5.4',
+      choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({ reasoningEffort: 'high' }) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-5.4',
+    messages: [{ role: 'user', content: 'hello' }],
+    tools: [{ name: 'get_weather', description: 'Get the weather', input_schema: { type: 'object', properties: {} } }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedBody).not.toHaveProperty('reasoning_effort')
+})
+
+test('gpt-5.6 chat-completions escape hatch keeps reasoning effort without tools', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  process.env.OPENAI_API_FORMAT = 'chat_completions'
+  let capturedBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'gpt-5.6-sol',
+        choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({ reasoningEffort: 'high' }) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-5.6-sol',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedBody?.reasoning_effort).toBe('high')
+})
+
+test('auto-route leaves non gpt-5.4+ models on chat/completions', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'gpt-4o',
+        choices: [
+          { message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+        ],
+        usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-4o',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://api.openai.com/v1/chat/completions')
+})
+
+test('auto-route does NOT fire for arbitrary non-OpenAI gateway bases', async () => {
+  process.env.OPENAI_BASE_URL = 'https://gateway.example/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'gpt-5.6-sol',
+        choices: [
+          { message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+        ],
+        usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-5.6-sol',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://gateway.example/v1/chat/completions')
+})
+
+test('auto-routed responses on a bare Azure resource base normalizes to the v1 surface', async () => {
+  process.env.OPENAI_BASE_URL = 'https://myres.openai.azure.com'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(
+      JSON.stringify({
+        id: 'resp-1',
+        model: 'gpt-5.6-terra',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
+          },
+        ],
+        usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-5.6-terra',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://myres.openai.azure.com/openai/v1/responses')
+})
+
+test('auto-routed responses on the Azure v1 base appends /responses without rewriting the path', async () => {
+  process.env.OPENAI_BASE_URL = 'https://myres.openai.azure.com/openai/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(
+      JSON.stringify({
+        id: 'resp-1',
+        model: 'gpt-5.6-luna',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
+          },
+        ],
+        usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-5.6-luna',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://myres.openai.azure.com/openai/v1/responses')
+})
+
+test('Azure responses URL normalization drops a configured query string', async () => {
+  process.env.OPENAI_BASE_URL = 'https://myres.openai.azure.com/openai/v1?api-version=2024-12-01-preview'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(JSON.stringify({
+      id: 'resp-1', model: 'gpt-5.6-sol',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+      usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hello' }], max_tokens: 64, stream: false })
+
+  expect(capturedUrl).toBe('https://myres.openai.azure.com/openai/v1/responses')
+})
+
+test('Azure responses URL normalization drops a query string after a trailing slash', async () => {
+  process.env.OPENAI_BASE_URL = 'https://myres.openai.azure.com/openai/v1/?api-version=2024-12-01-preview'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(JSON.stringify({
+      id: 'resp-1', model: 'gpt-5.6-sol',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+      usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hello' }], max_tokens: 64, stream: false })
+
+  expect(capturedUrl).toBe('https://myres.openai.azure.com/openai/v1/responses')
+})
+
+test('Azure chat-completions URL normalization drops a configured query string', async () => {
+  process.env.OPENAI_BASE_URL = 'https://myres.openai.azure.com/openai/v1?api-version=2024-12-01-preview'
+  process.env.OPENAI_API_KEY = 'test-key'
+  process.env.OPENAI_API_FORMAT = 'chat_completions'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(JSON.stringify({
+      id: 'chatcmpl-1', model: 'gpt-5.6-sol',
+      choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+    }), { headers: { 'Content-Type': 'application/json' } })
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hello' }], max_tokens: 64, stream: false })
+
+  expect(capturedUrl).toBe('https://myres.openai.azure.com/openai/deployments/gpt-5.6-sol/chat/completions?api-version=2024-12-01-preview')
+})
+
+test('auto-routed responses on an Azure /deployments/ base strips the deployment and uses the v1 surface', async () => {
+  process.env.OPENAI_BASE_URL = 'https://myres.openai.azure.com/openai/deployments/my-gpt56'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(
+      JSON.stringify({
+        id: 'resp-1',
+        model: 'gpt-5.6-sol',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
+          },
+        ],
+        usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-5.6-sol',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://myres.openai.azure.com/openai/v1/responses')
+})
+
+test('OPENAI_AZURE_STYLE routes gpt-5.6 on a custom base to {base}/openai/v1/responses', async () => {
+  process.env.OPENAI_BASE_URL = 'https://apim.contoso.example/azure-openai'
+  process.env.OPENAI_API_KEY = 'test-key'
+  process.env.OPENAI_AZURE_STYLE = '1'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(
+      JSON.stringify({
+        id: 'resp-1',
+        model: 'gpt-5.6-sol',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
+          },
+        ],
+        usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-5.6-sol',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://apim.contoso.example/azure-openai/openai/v1/responses')
+})
+
+test('Azure responses URL normalization strips stacked v1 and deployment suffixes', async () => {
+  process.env.OPENAI_BASE_URL =
+    'https://myres.openai.azure.com/openai/deployments/my-gpt56/openai/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(
+      JSON.stringify({
+        id: 'resp-1',
+        model: 'gpt-5.6-terra',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
+          },
+        ],
+        usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-5.6-terra',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://myres.openai.azure.com/openai/v1/responses')
+})
+
+test('explicit OPENAI_API_FORMAT=responses works for arbitrary Azure deployment names', async () => {
+  // Azure deployment names are arbitrary, so the model-name auto-route cannot
+  // recognize them; the documented path is the explicit responses format.
+  process.env.OPENAI_BASE_URL = 'https://myres.openai.azure.com/openai/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  process.env.OPENAI_API_FORMAT = 'responses'
+  let capturedUrl = ''
+  let capturedBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (input, init) => {
+    capturedUrl = String(input)
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+    return new Response(
+      JSON.stringify({
+        id: 'resp-1',
+        model: 'production-coding',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
+          },
+        ],
+        usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'production-coding',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe('https://myres.openai.azure.com/openai/v1/responses')
+  expect(capturedBody?.model).toBe('production-coding')
+})
+
+test('arbitrary Azure deployment names stay on chat/completions without the explicit format', async () => {
+  process.env.OPENAI_BASE_URL = 'https://myres.openai.azure.com/openai/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+
+  globalThis.fetch = (async (input, _init) => {
+    capturedUrl = String(input)
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'production-coding',
+        choices: [
+          { message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+        ],
+        usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'production-coding',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl).toBe(
+    'https://myres.openai.azure.com/openai/deployments/production-coding/chat/completions?api-version=2024-12-01-preview',
+  )
+})
+
+test('auto-routed gpt-5.6 on an Azure base nests reasoning.effort and the encrypted-content include', async () => {
+  process.env.OPENAI_BASE_URL = 'https://myres.openai.azure.com/openai/v1'
+  process.env.OPENAI_API_KEY = 'test-key'
+  let capturedUrl = ''
+  let capturedBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (input, init) => {
+    capturedUrl = String(input)
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+    return new Response(
+      JSON.stringify({
+        id: 'resp-1',
+        model: 'gpt-5.6-sol',
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'ok' }],
+          },
+        ],
+        usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({ reasoningEffort: 'high' }) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-5.6-sol',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(capturedUrl.endsWith('/openai/v1/responses')).toBe(true)
+  expect(capturedBody?.reasoning).toEqual({ effort: 'high', summary: 'auto' })
+  expect(capturedBody?.include).toEqual(['reasoning.encrypted_content'])
 })
 
 test('uses OpenAI-compatible responses endpoint with text chunk types when OPENAI_API_FORMAT=responses_compat', async () => {
@@ -1582,6 +2209,27 @@ test('stream idle timeout env parser parses and bounds overrides', async () => {
   expect(testApi.getStreamIdleTimeoutMs()).toBe(90_000)
 })
 
+test('API timeout env parser accepts safe positive integers and falls back otherwise', async () => {
+  const testApi = await getStreamIdleTestApi('api-timeout-env-parser')
+
+  delete process.env.API_TIMEOUT_MS
+  expect(testApi.getApiTimeoutMs()).toBe(600_000)
+
+  process.env.API_TIMEOUT_MS = '50'
+  expect(testApi.getApiTimeoutMs()).toBe(50)
+
+  process.env.API_TIMEOUT_MS = ' 50 '
+  expect(testApi.getApiTimeoutMs()).toBe(50)
+
+  process.env.API_TIMEOUT_MS = '3000000000'
+  expect(testApi.getApiTimeoutMs()).toBe(2_147_483_647)
+
+  for (const invalid of ['abc', '-5', '', '0', '1.5', '9007199254740993']) {
+    process.env.API_TIMEOUT_MS = invalid
+    expect(testApi.getApiTimeoutMs()).toBe(600_000)
+  }
+})
+
 test('Anthropic-compatible passthrough stream rejects with idle timeout when it stalls', async () => {
   process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS = '25'
   const stalled = makeStallingResponse(
@@ -2470,6 +3118,27 @@ test('uses max_tokens instead of max_completion_tokens for local providers', asy
   })
 })
 
+test('does not send stream_options to local OpenAI-compatible servers', async () => {
+  process.env.OPENAI_BASE_URL = 'http://127.0.0.1:8000/v1'
+
+  globalThis.fetch = (async (_input, init) => {
+    const body = JSON.parse(String(init?.body))
+    expect(body.stream).toBe(true)
+    expect(body.stream_options).toBeUndefined()
+    return new Response('', {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'local-vllm-model',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: true,
+  })
+})
+
 test('keeps max_completion_tokens for non-local non-github providers', async () => {
   process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
 
@@ -2608,6 +3277,7 @@ test('preserves Gemini tool call extra_content in follow-up requests', async () 
       {
         role: 'assistant',
         content: [
+          { type: 'thinking', thinking: 'I should inspect the working tree first.' },
           {
             type: 'tool_use',
             id: 'call_1',
@@ -4005,6 +4675,197 @@ test('gitlawb opengateway provider flag prefers OPENGATEWAY_API_KEY over generic
   expect(captured.authorization).toBe('Bearer fake-ogw-key')
 })
 
+test('longcat provider flag prefers LONGCAT_API_KEY over generic OPENAI_API_KEYS pool', async () => {
+  process.env.LONGCAT_API_KEY = 'fake-longcat-key'
+  process.env.OPENAI_API_KEYS = 'fake-openai-pool-a,fake-openai-pool-b'
+  delete process.env.OPENAI_BASE_URL
+  delete process.env.OPENAI_API_KEY
+
+  const result = applyProviderFlag('longcat', [])
+  expect(result.error).toBeUndefined()
+
+  const captured = await captureChatCompletionRequest()
+
+  expect(captured.url).toBe('https://api.longcat.chat/openai/v1/chat/completions')
+  expect(captured.authorization).toBe('Bearer fake-longcat-key')
+})
+
+test('longcat provider flag strips unsupported tool definitions', async () => {
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+    return makeChatCompletionResponse('LongCat-2.0')
+  }) as unknown as FetchType
+
+  process.env.LONGCAT_API_KEY = 'fake-longcat-key'
+  delete process.env.OPENAI_BASE_URL
+  delete process.env.OPENAI_API_KEY
+
+  expect(applyProviderFlag('longcat', []).error).toBeUndefined()
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'LongCat-2.0',
+    messages: [
+      { role: 'user', content: 'List files' },
+    ],
+    tools: [{
+      name: 'Bash',
+      description: 'Run a shell command',
+      input_schema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+    }],
+    max_tokens: 32,
+    stream: false,
+  })
+
+  expect(requestBody?.tools).toBeUndefined()
+})
+
+test('longcat rejects image input before dispatch', async () => {
+  process.env.LONGCAT_API_KEY = 'fake-longcat-key'
+  delete process.env.OPENAI_BASE_URL
+  delete process.env.OPENAI_API_KEY
+
+  expect(applyProviderFlag('longcat', []).error).toBeUndefined()
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await expect(client.beta.messages.create({
+    model: 'LongCat-2.0',
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Describe this image.' },
+        { type: 'image', source: { type: 'url', url: 'https://example.com/image.png' } },
+      ],
+    }],
+    max_tokens: 32,
+    stream: false,
+  })).rejects.toThrow('does not support image inputs')
+})
+
+test('longcat rejects image tool results before dispatch', async () => {
+  process.env.LONGCAT_API_KEY = 'fake-longcat-key'
+  delete process.env.OPENAI_BASE_URL
+  delete process.env.OPENAI_API_KEY
+  expect(applyProviderFlag('longcat', []).error).toBeUndefined()
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await expect(client.beta.messages.create({
+    model: 'LongCat-2.0',
+    messages: [
+      { role: 'user', content: 'Inspect the screenshot' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call_screenshot', name: 'Screenshot', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_screenshot', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } }] }] },
+    ],
+    tools: [{ name: 'Screenshot', description: 'Capture a screenshot', input_schema: { type: 'object', properties: {} } }],
+    max_tokens: 32,
+    stream: false,
+  })).rejects.toThrow('does not support image inputs')
+})
+
+test('longcat accepts the documented bare OpenAI SDK base URL', async () => {
+  process.env.LONGCAT_API_KEY = 'fake-longcat-key'
+  process.env.OPENAI_BASE_URL = 'https://api.longcat.chat/openai'
+  delete process.env.OPENAI_API_KEY
+
+  expect(applyProviderFlag('longcat', []).error).toBeUndefined()
+
+  const captured = await captureChatCompletionRequest()
+
+  expect(captured.url).toBe('https://api.longcat.chat/openai/v1/chat/completions')
+  expect(captured.authorization).toBe('Bearer fake-longcat-key')
+})
+
+test('longcat accepts the documented bare OpenAI SDK base URL with a trailing slash', async () => {
+  process.env.LONGCAT_API_KEY = 'fake-longcat-key'
+  process.env.OPENAI_BASE_URL = 'https://api.longcat.chat/openai/'
+  delete process.env.OPENAI_API_KEY
+
+  expect(applyProviderFlag('longcat', []).error).toBeUndefined()
+
+  const captured = await captureChatCompletionRequest()
+
+  expect(captured.url).toBe('https://api.longcat.chat/openai/v1/chat/completions')
+  expect(captured.authorization).toBe('Bearer fake-longcat-key')
+})
+
+test('longcat does not append chat completions to a configured endpoint URL', async () => {
+  process.env.LONGCAT_API_KEY = 'fake-longcat-key'
+  process.env.OPENAI_BASE_URL = 'https://api.longcat.chat/openai/v1/chat/completions'
+  delete process.env.OPENAI_API_KEY
+
+  expect(applyProviderFlag('longcat', []).error).toBeUndefined()
+
+  const captured = await captureChatCompletionRequest()
+
+  expect(captured.url).toBe('https://api.longcat.chat/openai/v1/chat/completions')
+  expect(captured.authorization).toBe('Bearer fake-longcat-key')
+})
+
+test('longcat normalizes a configured endpoint URL with a trailing slash', async () => {
+  process.env.LONGCAT_API_KEY = 'fake-longcat-key'
+  process.env.OPENAI_BASE_URL = 'https://api.longcat.chat/openai/v1/chat/completions/'
+  delete process.env.OPENAI_API_KEY
+
+  expect(applyProviderFlag('longcat', []).error).toBeUndefined()
+  const captured = await captureChatCompletionRequest()
+  expect(captured.url).toBe('https://api.longcat.chat/openai/v1/chat/completions')
+})
+
+test('longcat accepts the documented CodeBuddy endpoint URL', async () => {
+  process.env.LONGCAT_API_KEY = 'fake-longcat-key'
+  process.env.OPENAI_BASE_URL = 'https://api.longcat.chat/openai/chat/completions'
+  delete process.env.OPENAI_API_KEY
+
+  expect(applyProviderFlag('longcat', []).error).toBeUndefined()
+  const captured = await captureChatCompletionRequest()
+  expect(captured.url).toBe('https://api.longcat.chat/openai/chat/completions')
+})
+
+test('longcat prefers its dedicated credential over a copied key from another provider', async () => {
+  process.env.LONGCAT_API_KEY = 'fake-longcat-key'
+  process.env.MIMO_API_KEY = 'fake-mimo-key'
+  process.env.OPENAI_API_KEY = 'fake-mimo-key'
+  process.env.OPENAI_BASE_URL = 'https://api.longcat.chat/openai/v1'
+
+  const captured = await captureChatCompletionRequest('LongCat-2.0')
+
+  expect(captured.authorization).toBe('Bearer fake-longcat-key')
+})
+
+test('longcat provider flag never falls back to an OPENAI_API_KEYS pool', async () => {
+  process.env.OPENAI_API_KEYS = 'other-provider-secret'
+  delete process.env.LONGCAT_API_KEY
+  delete process.env.OPENAI_BASE_URL
+  delete process.env.OPENAI_API_KEY
+
+  const result = applyProviderFlag('longcat', [])
+  expect(result.error).toBeUndefined()
+
+  const captured = await captureChatCompletionRequest()
+
+  expect(captured.authorization).not.toBe('Bearer other-provider-secret')
+})
+
+test('dedicated-only ClinePass route never falls back to generic OpenAI credentials', async () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.cline.bot/api/v1'
+  process.env.OPENAI_MODEL = 'cline-pass/deepseek-v4-flash'
+  process.env.OPENAI_API_KEY = 'generic-openai-key'
+  process.env.OPENAI_API_KEYS = 'generic-openai-pool-a,generic-openai-pool-b'
+  delete process.env.CLINE_API_KEY
+
+  const captured = await captureChatCompletionRequest(
+    'cline-pass/deepseek-v4-flash',
+  )
+
+  expect(captured.authorization).toBeNull()
+})
+
 test('gitlawb opengateway provider flag uses generic OPENAI_API_KEYS pool before generic OPENAI_API_KEY fallback', async () => {
   process.env.OPENGATEWAY_BASE_URL = 'http://localhost:8181/v1'
   process.env.OPENAI_API_KEYS = 'fake-openai-pool-a,fake-openai-pool-b'
@@ -4107,6 +4968,37 @@ test('OPENAI_API_KEYS rotates to the next key on rate-limit failure', async () =
     max_tokens: 32,
     stream: false,
   })
+
+  expect(authorizations).toEqual(['Bearer key-a', 'Bearer key-b'])
+})
+
+test('OPENAI_API_KEYS does not reuse a cooled-down key after every key is rate-limited', async () => {
+  const authorizations: Array<string | null> = []
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
+  process.env.OPENAI_MODEL = 'gpt-5.5'
+  process.env.OPENAI_API_KEYS = 'key-a,key-b'
+  delete process.env.OPENAI_API_KEY
+
+  globalThis.fetch = (async (_input, init) => {
+    const headers = init?.headers as Record<string, string> | undefined
+    authorizations.push(headers?.Authorization ?? headers?.authorization ?? null)
+    return new Response(JSON.stringify({ error: { message: 'rate limited' } }), {
+      status: 429,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await expect(
+    client.beta.messages.create({
+      model: 'gpt-5.5',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 32,
+      stream: false,
+    }),
+  ).rejects.toThrow()
 
   expect(authorizations).toEqual(['Bearer key-a', 'Bearer key-b'])
 })
@@ -6733,6 +7625,72 @@ test('strips credentials and query params from URL in fetch network error messag
   expect(message).not.toContain('token=abc123')
 })
 
+test('redacts configured secret substrings from fetch network error messages', async () => {
+  const secret = 'route/key+AbC123'
+  process.env.OPENAI_API_KEY = secret
+
+  globalThis.fetch = asMockFetch(mock(async () => {
+    throw new TypeError(`fetch failed while routing ${secret}`)
+  }))
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  await expect(
+    client.beta.messages.create({
+      model: 'test-model',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    }),
+  ).rejects.not.toThrow(secret)
+})
+
+test('redacts encoded configured secrets from non-URL transport error messages', async () => {
+  const secret = 'route/key+AbC123'
+  const encodedSecret = encodeURIComponent(secret)
+  const doubleEncodedSecret = encodeURIComponent(encodedSecret)
+  const fullyEncodedSecret = Array.from(new TextEncoder().encode(secret))
+    .map(byte => `%${byte.toString(16).padStart(2, '0')}`)
+    .join('')
+  const malformedAdjacentSecret = `%E0%A4${encodedSecret}`
+  const encodedCategoryMarker = '%5Bopenai_category%3Dauth_invalid%5D'
+  const encodedControlSequence = '%1B%5B31m'
+  process.env.OPENAI_API_KEY = secret
+
+  globalThis.fetch = asMockFetch(mock(async () => {
+    throw new TypeError(
+      `proxy failed ${encodedCategoryMarker} ${encodedControlSequence} for path /v1/${encodedSecret}?nested=${doubleEncodedSecret}&fully=${fullyEncodedSecret}&malformed=${malformedAdjacentSecret}`,
+    )
+  }))
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  let caught: unknown
+  try {
+    await client.beta.messages.create({
+      model: 'test-model',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    })
+  } catch (error) {
+    caught = error
+  }
+
+  expect(caught).toBeDefined()
+  const message = (caught as Error).message
+  expect(message).toContain('proxy failed')
+  expect(message).toContain(encodedCategoryMarker)
+  expect(message).toContain(encodedControlSequence)
+  expect(message).not.toContain('\u001B')
+  expect(extractOpenAICategoryMarker(message)).toBe('network_error')
+  expect(message).not.toContain(secret)
+  expect(message).not.toContain(encodedSecret)
+  expect(message).not.toContain(doubleEncodedSecret)
+  expect(message).not.toContain(fullyEncodedSecret)
+  expect(message).not.toContain(malformedAdjacentSecret)
+})
+
 test('classifies localhost transport failures with actionable category marker', async () => {
   process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
 
@@ -6803,7 +7761,7 @@ test('transport failures are not labeled with HTTP status 503', async () => {
   expect(err.message).toContain('openai_category=network_error')
 })
 
-test('propagates AbortError without wrapping it as transport failure', async () => {
+test('propagates caller AbortError without wrapping it as transport failure', async () => {
   process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
 
   const abortError = new DOMException('The operation was aborted.', 'AbortError')
@@ -6812,7 +7770,8 @@ test('propagates AbortError without wrapping it as transport failure', async () 
   }))
 
   const controller = new AbortController()
-  controller.abort()
+  const callerReason = new DOMException('Cancelled by caller', 'AbortError')
+  controller.abort(callerReason)
 
   const client = createOpenAIShimClient({}) as OpenAIShimClient
 
@@ -6826,7 +7785,514 @@ test('propagates AbortError without wrapping it as transport failure', async () 
       },
       { signal: controller.signal },
     ),
-  ).rejects.toBe(abortError)
+  ).rejects.toBe(callerReason)
+})
+
+test('classifies a pre-header API timeout without replaying the request', async () => {
+  process.env.API_TIMEOUT_MS = '20'
+  const pathSecret = 'route/key+AbC123'
+  const encodedPathSecret = encodeURIComponent(pathSecret)
+  const doubleEncodedPathSecret = encodeURIComponent(encodedPathSecret)
+  const escapeLookingSecret = 'abc%2FdefLONG'
+  const encodedEscapeLookingSecret = encodeURIComponent(escapeLookingSecret)
+  const decodedEscapeLookingSecret = decodeURIComponent(escapeLookingSecret)
+  const malformedUtf8Secret = 'éSECRET_VALUE_123'
+  const encodedMalformedUtf8Secret = encodeURIComponent(malformedUtf8Secret)
+  process.env.OPENAI_API_KEY = pathSecret
+  process.env.OPENROUTER_API_KEY = escapeLookingSecret
+  process.env.DEEPSEEK_API_KEY = malformedUtf8Secret
+  process.env.OPENAI_BASE_URL =
+    `https://user:password@slow.example.test/v1/invalid%ZZ/${doubleEncodedPathSecret}/${encodedEscapeLookingSecret}/%E0%A4${encodedMalformedUtf8Secret}` +
+    `?prompt=${encodedPathSecret}&nested=${doubleEncodedPathSecret}` +
+    `&escape=${encodedEscapeLookingSecret}&malformed=%E0%A4${encodedMalformedUtf8Secret}` +
+    '&token=secret'
+  let fetchCalls = 0
+  let completedGenerations = 0
+  const receivedBodies: string[] = []
+  globalThis.fetch = (async (_input, init) => {
+    fetchCalls++
+    receivedBodies.push(String(init?.body))
+    return new Promise<Response>((resolve, reject) => {
+      setTimeout(() => {
+        completedGenerations++
+        resolve(makeChatCompletionResponse('gpt-4o-mini'))
+      }, 50)
+      const signal = init?.signal
+      if (!signal) return
+      const rejectFromAbort = () => {
+        reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+      }
+      signal.addEventListener('abort', rejectFromAbort, { once: true })
+      if (signal.aborted) rejectFromAbort()
+    })
+  }) as unknown as FetchType
+
+  const safety = new AbortController()
+  const safetyTimer = setTimeout(() => safety.abort(), 500)
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  let caught: unknown
+  try {
+    await waitForPromise(
+      client.beta.messages.create(
+        {
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: 'hello' }],
+          max_tokens: 64,
+          stream: false,
+        },
+        { signal: safety.signal },
+      ),
+      750,
+      'pre-header timeout did not settle',
+    )
+  } catch (error) {
+    caught = error
+  } finally {
+    clearTimeout(safetyTimer)
+  }
+  await new Promise(resolve => setTimeout(resolve, 60))
+
+  expect(caught).toBeDefined()
+  const error = caught as Error & { constructor: { name: string } }
+  expect(error.constructor.name).toBe('APIConnectionError')
+  expect(isOpenAIRequestNonReplayable(error)).toBe(true)
+  expect(error.message).toContain('no response headers within 20ms (API_TIMEOUT_MS)')
+  expect(error.message).toContain('slow.example.test')
+  expect(error.message).toContain('openai_category=request_timeout')
+  expect(error.message).not.toContain('password')
+  expect(error.message).not.toContain('token=secret')
+  expect(error.message).not.toContain(pathSecret)
+  expect(error.message).not.toContain(encodedPathSecret)
+  expect(error.message).not.toContain(doubleEncodedPathSecret)
+  expect(error.message).not.toContain(escapeLookingSecret)
+  expect(error.message).not.toContain(encodedEscapeLookingSecret)
+  expect(error.message).not.toContain(decodedEscapeLookingSecret)
+  expect(error.message).not.toContain(malformedUtf8Secret)
+  expect(error.message).not.toContain(encodedMalformedUtf8Secret)
+  expect(fetchCalls).toBe(1)
+  expect(receivedBodies).toHaveLength(1)
+  expect(completedGenerations).toBe(1)
+})
+
+test('does not proxy-retry when a deadline abort surfaces as fetch failed', async () => {
+  process.env.API_TIMEOUT_MS = '20'
+  let fetchCalls = 0
+  globalThis.fetch = (async (_input, init) => {
+    fetchCalls++
+    return new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal
+      const rejectFromAbort = () => reject(new TypeError('fetch failed'))
+      signal?.addEventListener('abort', rejectFromAbort, { once: true })
+      if (signal?.aborted) rejectFromAbort()
+    })
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  await expect(
+    client.beta.messages.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    }),
+  ).rejects.toThrow('no response headers within 20ms (API_TIMEOUT_MS)')
+
+  expect(fetchCalls).toBe(1)
+})
+
+test('deadline wins when an abort-ignoring fetch resolves 504 afterward', async () => {
+  process.env.API_TIMEOUT_MS = '20'
+  let fetchCalls = 0
+  globalThis.fetch = (async (_input, init) => {
+    fetchCalls++
+    return new Promise<Response>(resolve => {
+      const resolveAfterAbort = () => {
+        resolve(new Response('Gateway Timeout', { status: 504 }))
+      }
+      init?.signal?.addEventListener('abort', resolveAfterAbort, { once: true })
+      if (init?.signal?.aborted) resolveAfterAbort()
+    })
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  await expect(
+    client.beta.messages.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    }),
+  ).rejects.toThrow('no response headers within 20ms (API_TIMEOUT_MS)')
+
+  expect(fetchCalls).toBe(1)
+})
+
+test('gives a proxy retry its own response-header deadline', async () => {
+  process.env.API_TIMEOUT_MS = '50'
+  let fetchCalls = 0
+  globalThis.fetch = (async () => {
+    fetchCalls++
+    if (fetchCalls === 1) {
+      await new Promise(resolve => setTimeout(resolve, 30))
+      return new Response('Gateway Timeout', { status: 504 })
+    }
+    await new Promise(resolve => setTimeout(resolve, 30))
+    return makeChatCompletionResponse('gpt-4o-mini')
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const response = await client.beta.messages.create({
+    model: 'gpt-4o-mini',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(response).toBeDefined()
+  expect(fetchCalls).toBe(2)
+})
+
+test('bounds nested URL decoding while retaining encoded secret redaction', async () => {
+  const secret = 'route/key+AbC123'
+  const secretVariants = [secret]
+  for (let layer = 0; layer < 4; layer++) {
+    secretVariants.push(
+      encodeURIComponent(secretVariants[secretVariants.length - 1]!),
+    )
+  }
+  const deeplyNestedValue = `%${'25'.repeat(200)}`
+  process.env.OPENAI_API_KEY = secret
+  process.env.OPENAI_BASE_URL =
+    `https://slow.example.test/v1/${deeplyNestedValue}/${secretVariants[4]}`
+  globalThis.fetch = asMockFetch(mock(async () => {
+    throw new TypeError('fetch failed')
+  }))
+
+  const originalDecodeURIComponent = globalThis.decodeURIComponent
+  let decodeCalls = 0
+  globalThis.decodeURIComponent = ((value: string) => {
+    decodeCalls++
+    return originalDecodeURIComponent(value)
+  }) as typeof decodeURIComponent
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  let caught: unknown
+  try {
+    await client.beta.messages.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    })
+  } catch (error) {
+    caught = error
+  } finally {
+    globalThis.decodeURIComponent = originalDecodeURIComponent
+  }
+
+  expect(caught).toBeDefined()
+  for (const secretVariant of secretVariants) {
+    expect((caught as Error).message).not.toContain(secretVariant)
+  }
+  expect(decodeCalls).toBeLessThanOrEqual(32)
+})
+
+test('decodes malformed URL escape runs in linear work', async () => {
+  const secret = 'route/key+AbC123'
+  const encodedSecret = encodeURIComponent(secret)
+  const malformedEscapeCount = 200
+  const malformedUtf8Run = '%80'.repeat(malformedEscapeCount)
+  process.env.OPENAI_API_KEY = secret
+  process.env.OPENAI_BASE_URL =
+    `https://slow.example.test/v1/${malformedUtf8Run}/${encodedSecret}`
+  globalThis.fetch = asMockFetch(mock(async () => {
+    throw new TypeError('fetch failed')
+  }))
+
+  const originalDecodeURIComponent = globalThis.decodeURIComponent
+  let malformedDecodeCalls = 0
+  globalThis.decodeURIComponent = ((value: string) => {
+    if (value.includes('%80')) malformedDecodeCalls++
+    return originalDecodeURIComponent(value)
+  }) as typeof decodeURIComponent
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  let caught: unknown
+  try {
+    await client.beta.messages.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    })
+  } catch (error) {
+    caught = error
+  } finally {
+    globalThis.decodeURIComponent = originalDecodeURIComponent
+  }
+
+  expect(caught).toBeDefined()
+  expect((caught as Error).message).not.toContain(secret)
+  expect((caught as Error).message).not.toContain(encodedSecret)
+  expect(malformedDecodeCalls).toBeLessThanOrEqual(malformedEscapeCount * 10)
+})
+
+test('preserves caller cancellation while waiting for response headers without retrying', async () => {
+  process.env.API_TIMEOUT_MS = '200'
+  let fetchCalls = 0
+  globalThis.fetch = (async (_input, init) => {
+    fetchCalls++
+    return pendingFetchUntilAbort(init)
+  }) as unknown as FetchType
+
+  const caller = new AbortController()
+  const callerReason = new DOMException('Cancelled by user', 'AbortError')
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const originalAbortSignalAny = Object.getOwnPropertyDescriptor(
+    AbortSignal,
+    'any',
+  )
+  Object.defineProperty(AbortSignal, 'any', {
+    value: undefined,
+    configurable: true,
+  })
+  try {
+    const request = client.beta.messages.create(
+      {
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: 'hello' }],
+        max_tokens: 64,
+        stream: false,
+      },
+      { signal: caller.signal },
+    )
+
+    setTimeout(() => caller.abort(callerReason), 10)
+
+    await expect(
+      waitForPromise(request, 500, 'caller abort did not settle'),
+    ).rejects.toBe(callerReason)
+    expect(fetchCalls).toBe(1)
+  } finally {
+    if (originalAbortSignalAny) {
+      Object.defineProperty(AbortSignal, 'any', originalAbortSignalAny)
+    }
+  }
+})
+
+test('native signal composition preserves the caller abort reason when fetch rejects AbortError', async () => {
+  expect(typeof AbortSignal.any).toBe('function')
+  process.env.API_TIMEOUT_MS = '200'
+  let fetchCalls = 0
+  const fetchAbortError = new DOMException(
+    'The operation was aborted.',
+    'AbortError',
+  )
+  globalThis.fetch = (async (_input, init) => {
+    fetchCalls++
+    return new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal
+      if (!signal) return
+      const rejectFromAbort = () => reject(fetchAbortError)
+      signal.addEventListener('abort', rejectFromAbort, { once: true })
+      if (signal.aborted) rejectFromAbort()
+    })
+  }) as unknown as FetchType
+
+  const caller = new AbortController()
+  const callerReason = new DOMException('Cancelled by user', 'AbortError')
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const request = client.beta.messages.create(
+    {
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: false,
+    },
+    { signal: caller.signal },
+  )
+
+  const abortTimer = setTimeout(() => caller.abort(callerReason), 10)
+
+  try {
+    await expect(
+      waitForPromise(request, 500, 'caller abort did not settle'),
+    ).rejects.toBe(callerReason)
+  } finally {
+    clearTimeout(abortTimer)
+  }
+  expect(fetchCalls).toBe(1)
+})
+
+test('caller abort winning the timeout catch race prevents a retry', async () => {
+  process.env.API_TIMEOUT_MS = '20'
+  let fetchCalls = 0
+  const caller = new AbortController()
+  const callerReason = new DOMException('Cancelled by user', 'AbortError')
+  globalThis.fetch = (async (_input, init) => {
+    fetchCalls++
+    return new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal
+      if (!signal) return
+      const rejectFromAbort = () => {
+        reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+        if (fetchCalls === 1) {
+          queueMicrotask(() => caller.abort(callerReason))
+        }
+      }
+      signal.addEventListener('abort', rejectFromAbort, { once: true })
+      if (signal.aborted) rejectFromAbort()
+    })
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await expect(
+    waitForPromise(
+      client.beta.messages.create(
+        {
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: 'hello' }],
+          max_tokens: 64,
+          stream: false,
+        },
+        { signal: caller.signal },
+      ),
+      500,
+      'caller abort race did not settle',
+    ),
+  ).rejects.toBe(callerReason)
+  expect(fetchCalls).toBe(1)
+})
+
+test('manual signal fallback preserves caller cancellation after headers arrive', async () => {
+  process.env.API_TIMEOUT_MS = '200'
+  const fetchSignals: AbortSignal[] = []
+  const stalled = makeStallingResponse(
+    makeOpenAIStreamFrame({ role: 'assistant', content: 'started' }),
+  )
+  globalThis.fetch = (async (_input, init) => {
+    if (init?.signal) fetchSignals.push(init.signal)
+    return stalled.response
+  }) as unknown as FetchType
+
+  const caller = new AbortController()
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const originalAbortSignalAny = Object.getOwnPropertyDescriptor(
+    AbortSignal,
+    'any',
+  )
+  Object.defineProperty(AbortSignal, 'any', {
+    value: undefined,
+    configurable: true,
+  })
+  try {
+    const result = await client.beta.messages
+      .create(
+        {
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: 'hello' }],
+          max_tokens: 64,
+          stream: true,
+        },
+        { signal: caller.signal },
+      )
+      .withResponse()
+
+    await expectAbortStopsStream({
+      abort: () => caller.abort(),
+      cancelReasons: stalled.cancelReasons,
+      expectedEventsBeforeAbort: 1,
+      label: 'manual combined signal after headers',
+      stream: result.data as ShimStream,
+    })
+
+    expect(fetchSignals).toHaveLength(1)
+    expect(fetchSignals[0].aborted).toBe(true)
+  } finally {
+    stalled.close()
+    if (originalAbortSignalAny) {
+      Object.defineProperty(AbortSignal, 'any', originalAbortSignalAny)
+    }
+  }
+})
+
+test('manual signal fallback removes caller forwarding after the body settles', async () => {
+  process.env.API_TIMEOUT_MS = '200'
+  globalThis.fetch = asMockFetch(mock(async () =>
+    makeChatCompletionResponse('gpt-4o-mini')))
+
+  const caller = new AbortController()
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const originalAbortSignalAny = Object.getOwnPropertyDescriptor(
+    AbortSignal,
+    'any',
+  )
+  Object.defineProperty(AbortSignal, 'any', {
+    value: undefined,
+    configurable: true,
+  })
+  try {
+    for (let request = 0; request < 2; request++) {
+      await client.beta.messages.create(
+        {
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: 'hello' }],
+          max_tokens: 64,
+          stream: false,
+        },
+        { signal: caller.signal },
+      )
+      expect(getEventListeners(caller.signal, 'abort')).toHaveLength(0)
+    }
+  } finally {
+    if (originalAbortSignalAny) {
+      Object.defineProperty(AbortSignal, 'any', originalAbortSignalAny)
+    }
+  }
+})
+
+test('disarms the API timeout after headers arrive while the body keeps streaming', async () => {
+  process.env.API_TIMEOUT_MS = '20'
+  const fetchSignals: AbortSignal[] = []
+  const encoder = new TextEncoder()
+  globalThis.fetch = (async (_input, init) => {
+    if (init?.signal) fetchSignals.push(init.signal)
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          setTimeout(() => {
+            controller.enqueue(encoder.encode(makeOpenAIStreamFrame(
+              { role: 'assistant', content: 'late body' },
+              'stop',
+            )))
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+            controller.close()
+          }, 50)
+        },
+      }),
+      { headers: { 'Content-Type': 'text/event-stream' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const result = await client.beta.messages
+    .create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 64,
+      stream: true,
+    })
+    .withResponse()
+
+  const events: Array<Record<string, unknown>> = []
+  for await (const event of result.data) events.push(event)
+
+  expect(events.length).toBeGreaterThan(0)
+  expect(fetchSignals).toHaveLength(1)
+  expect(fetchSignals[0].aborted).toBe(false)
 })
 
 test('classifies chat-completions endpoint 404 failures with endpoint_not_found marker', async () => {
@@ -8743,6 +10209,210 @@ test('NVIDIA NIM Z.AI GLM omits chat template thinking kwargs when thinking is d
   expect(requestBody?.chat_template_kwargs).toBeUndefined()
 })
 
+// Regression test for #1950: GLM-5.2 served through NVIDIA NIM
+// (`integrate.api.nvidia.com`) must never receive the Z.AI-proprietary
+// `tool_stream` parameter. Streaming tool calls are simply not streamed on
+// this gateway; sending the parameter aborts the request with
+// `400 Unsupported parameter(s): tool_stream`.
+test('NVIDIA NIM Z.AI GLM streaming request with tools does not send tool_stream (regression #1950)', async () => {
+  process.env.OPENAI_BASE_URL = 'https://integrate.api.nvidia.com/v1'
+  process.env.NVIDIA_API_KEY = 'nvapi-test'
+
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+    return makeSseResponse(makeStreamChunks([
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'z-ai/glm-5.2',
+        choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'z-ai/glm-5.2',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      },
+    ]))
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'z-ai/glm-5.2',
+    messages: [{ role: 'user', content: 'run pwd' }],
+    tools: [
+      {
+        name: 'Bash',
+        description: 'Run a shell command',
+        input_schema: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      },
+    ],
+    max_tokens: 64,
+    stream: true,
+  })
+
+  // tool_stream is a Z.AI-only streaming extension; NVIDIA NIM rejects it with
+  // `400 Unsupported parameter(s): tool_stream`. Streaming tool calls simply
+  // aren't streamed on this gateway.
+  expect(requestBody?.tool_stream).toBeUndefined()
+})
+
+// Regression test for #1950: even if a gateway rejects `tool_stream` with a
+// 400 (e.g. NVIDIA NIM: `Unsupported parameter(s): tool_stream`), the shim
+// self-heals by dropping only that parameter and retrying with tools intact.
+// Here we exercise the generic self-heal using a Z.AI-contract gateway that
+// actually sends `tool_stream`, then rejects it — proving the retry drops the
+// parameter rather than surfacing a hard error.
+test('Shim self-heals a JSON `tool_stream` rejection by retrying without it (#1950)', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
+  process.env.OPENAI_API_KEY = 'sk-zai-test'
+
+  const requestBodies: Array<Record<string, unknown>> = []
+  let callCount = 0
+  globalThis.fetch = (async (_input, init) => {
+    requestBodies.push(JSON.parse(String(init?.body)))
+    callCount += 1
+    if (callCount === 1) {
+      return new Response(
+        '{"error":{"message":"tool_stream is unsupported"}}',
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      )
+    }
+    return makeSseResponse(makeStreamChunks([
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'glm-5.2',
+        choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'glm-5.2',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      },
+    ]))
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  // Must not throw — the self-heal retry succeeds.
+  await client.beta.messages.create({
+    model: 'glm-5.2',
+    messages: [{ role: 'user', content: 'run pwd' }],
+    tools: [
+      {
+        name: 'Bash',
+        description: 'Run a shell command',
+        input_schema: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      },
+    ],
+    max_tokens: 64,
+    stream: true,
+  })
+
+  // First attempt sent tool_stream; the self-heal dropped it and retried.
+  expect(requestBodies).toHaveLength(2)
+  expect(requestBodies[0]?.tool_stream).toBe(true)
+  expect(requestBodies[1]?.tool_stream).toBeUndefined()
+  // Tools are preserved across the retry.
+  expect(Array.isArray(requestBodies[1]?.tools)).toBe(true)
+})
+
+test('Shim stops after one tool_stream self-heal retry when the retry also fails (#1950)', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
+  process.env.OPENAI_API_KEY = 'sk-zai-test'
+
+  const requestBodies: Array<Record<string, unknown>> = []
+  globalThis.fetch = (async (_input, init) => {
+    requestBodies.push(JSON.parse(String(init?.body)))
+    return new Response(
+      '{"error":{"message":"tool_stream is unsupported"}}',
+      { status: 400, headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await expect(
+    client.beta.messages.create({
+      model: 'glm-5.2',
+      messages: [{ role: 'user', content: 'run pwd' }],
+      tools: [{
+        name: 'Bash',
+        description: 'Run a shell command',
+        input_schema: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      }],
+      max_tokens: 64,
+      stream: true,
+    }),
+  ).rejects.toThrow()
+
+  expect(requestBodies).toHaveLength(2)
+  expect(requestBodies[0]?.tool_stream).toBe(true)
+  expect(requestBodies[1]?.tool_stream).toBeUndefined()
+})
+
+test('Shim retries a tool_stream rejection with the same pooled credential (#1950)', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
+  process.env.OPENAI_API_KEYS = 'key-a,key-b'
+  delete process.env.OPENAI_API_KEY
+
+  const authorizations: Array<string | null> = []
+  let callCount = 0
+  globalThis.fetch = (async (_input, init) => {
+    const headers = init?.headers as Record<string, string> | undefined
+    authorizations.push(headers?.Authorization ?? headers?.authorization ?? null)
+    callCount += 1
+    if (callCount === 1) {
+      return new Response(
+        '{"error":{"message":"Validation: Unsupported parameter(s): `tool_stream`"}}',
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      )
+    }
+    return makeSseResponse(makeStreamChunks([
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'glm-5.2',
+        choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'glm-5.2',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      },
+    ]))
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'glm-5.2',
+    messages: [{ role: 'user', content: 'run pwd' }],
+    tools: [{
+      name: 'Bash',
+      description: 'Run a shell command',
+      input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+    }],
+    max_tokens: 64,
+    stream: true,
+  })
+
+  expect(authorizations).toEqual(['Bearer key-a', 'Bearer key-a'])
+})
+
 test('Z.AI GLM-5.2: streaming requests with tools send tool_stream', async () => {
   process.env.OPENAI_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
   process.env.OPENAI_API_KEY = 'sk-zai-test'
@@ -9105,6 +10775,9 @@ test('strips Anthropic attribution header block from responses-API instructions 
 test('emits reasoning_effort on chat_completions when reasoningEffort is passed', async () => {
   process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
   process.env.OPENAI_API_KEY = 'test-key'
+  // gpt-5.4 now auto-routes to /responses on api.openai.com; opt back into
+  // chat_completions to exercise its top-level reasoning_effort serialization.
+  process.env.OPENAI_API_FORMAT = 'chat_completions'
 
   let requestBody: Record<string, unknown> | undefined
 
@@ -9179,6 +10852,9 @@ test('omits reasoning_effort on chat_completions when no override and model has 
 test('emits reasoning_effort from codex alias default when no override is passed', async () => {
   process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
   process.env.OPENAI_API_KEY = 'test-key'
+  // gpt-5.4 now auto-routes to /responses on api.openai.com; opt back into
+  // chat_completions to exercise its top-level reasoning_effort serialization.
+  process.env.OPENAI_API_FORMAT = 'chat_completions'
 
   let requestBody: Record<string, unknown> | undefined
 
@@ -9433,6 +11109,195 @@ function makeCodexSseResponse(responseData: Record<string, unknown>): Response {
   const data = JSON.stringify(responseData)
   return makeSseResponse([`event: response.completed\ndata: ${data}\n\n`])
 }
+
+test('GitHub Copilot codex responses transport does not replay after a pre-header timeout', async () => {
+  process.env.CLAUDE_CODE_USE_GITHUB = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.githubcopilot.com'
+  process.env.OPENAI_API_KEY = 'test-token'
+  process.env.API_TIMEOUT_MS = '20'
+  let fetchCalls = 0
+  const requestUrls: string[] = []
+
+  globalThis.fetch = (async (input, init) => {
+    fetchCalls++
+    requestUrls.push(String(input))
+    return pendingFetchUntilAbort(init)
+  }) as unknown as FetchType
+
+  const safety = new AbortController()
+  const safetyTimer = setTimeout(() => safety.abort(), 500)
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  let caught: unknown
+  try {
+    await waitForPromise(
+      client.beta.messages.create(
+        {
+          model: 'gpt-5',
+          messages: [{ role: 'user', content: 'hello' }],
+          max_tokens: 32,
+          stream: false,
+        },
+        { signal: safety.signal },
+      ),
+      750,
+      'GitHub codex responses timeout did not settle',
+    )
+  } catch (error) {
+    caught = error
+  } finally {
+    clearTimeout(safetyTimer)
+  }
+
+  expect(caught).toBeDefined()
+  const error = caught as Error & { constructor: { name: string } }
+  expect(error.constructor.name).toBe('APIConnectionError')
+  expect(isOpenAIRequestNonReplayable(error)).toBe(true)
+  expect(fetchCalls).toBe(1)
+  expect(requestUrls).toEqual([
+    'https://api.githubcopilot.com/responses',
+  ])
+})
+
+test('GitHub Copilot responses fallback does not replay after a pre-header timeout', async () => {
+  process.env.CLAUDE_CODE_USE_GITHUB = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.githubcopilot.com'
+  process.env.OPENAI_API_KEY = 'test-token'
+  process.env.API_TIMEOUT_MS = '20'
+  const requestUrls: string[] = []
+
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input)
+    requestUrls.push(url)
+    if (url.endsWith('/chat/completions')) {
+      return makeGithubChatFallbackResponse()
+    }
+    return pendingFetchUntilAbort(init)
+  }) as unknown as FetchType
+
+  const safety = new AbortController()
+  const safetyTimer = setTimeout(() => safety.abort(), 500)
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  let caught: unknown
+  try {
+    await waitForPromise(
+      client.beta.messages.create(
+        {
+          model: 'gpt-4',
+          messages: [{ role: 'user', content: 'hello' }],
+          max_tokens: 32,
+          stream: false,
+        },
+        { signal: safety.signal },
+      ),
+      750,
+      'GitHub responses fallback timeout did not settle',
+    )
+  } catch (error) {
+    caught = error
+  } finally {
+    clearTimeout(safetyTimer)
+  }
+
+  expect(caught).toBeDefined()
+  const error = caught as Error & { constructor: { name: string } }
+  expect(error.constructor.name).toBe('APIConnectionError')
+  expect(isOpenAIRequestNonReplayable(error)).toBe(true)
+  expect(requestUrls).toEqual([
+    'https://api.githubcopilot.com/chat/completions',
+    'https://api.githubcopilot.com/responses',
+  ])
+})
+
+test('GitHub Copilot responses fallback preserves caller abort without retrying', async () => {
+  process.env.CLAUDE_CODE_USE_GITHUB = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.githubcopilot.com'
+  process.env.OPENAI_API_KEY = 'test-token'
+  process.env.API_TIMEOUT_MS = '200'
+  let fetchCalls = 0
+
+  globalThis.fetch = (async (input, init) => {
+    fetchCalls++
+    if (String(input).endsWith('/chat/completions')) {
+      return makeGithubChatFallbackResponse()
+    }
+    return pendingFetchUntilAbort(init)
+  }) as unknown as FetchType
+
+  const caller = new AbortController()
+  const callerReason = new DOMException('Cancelled by user', 'AbortError')
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const request = client.beta.messages.create(
+    {
+      model: 'gpt-4',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 32,
+      stream: false,
+    },
+    { signal: caller.signal },
+  )
+  setTimeout(() => caller.abort(callerReason), 10)
+
+  await expect(
+    waitForPromise(request, 500, 'GitHub responses fallback abort did not settle'),
+  ).rejects.toBe(callerReason)
+  expect(fetchCalls).toBe(2)
+})
+
+test('GitHub Copilot responses fallback preserves non-caller transport aborts', async () => {
+  process.env.CLAUDE_CODE_USE_GITHUB = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.githubcopilot.com'
+  process.env.OPENAI_API_KEY = 'test-token'
+  let fetchCalls = 0
+  const transportAbort = new DOMException('Proxy aborted request', 'AbortError')
+
+  globalThis.fetch = (async input => {
+    fetchCalls++
+    if (String(input).endsWith('/chat/completions')) {
+      return makeGithubChatFallbackResponse()
+    }
+    throw transportAbort
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await expect(
+    client.beta.messages.create({
+      model: 'gpt-4',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 32,
+      stream: false,
+    }),
+  ).rejects.toBe(transportAbort)
+  expect(fetchCalls).toBe(2)
+})
+
+test('GitHub Copilot responses fallback does not retry non-retryable HTTP failures', async () => {
+  process.env.CLAUDE_CODE_USE_GITHUB = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.githubcopilot.com'
+  process.env.OPENAI_API_KEY = 'test-token'
+  let fetchCalls = 0
+
+  globalThis.fetch = (async input => {
+    fetchCalls++
+    if (String(input).endsWith('/chat/completions')) {
+      return makeGithubChatFallbackResponse()
+    }
+    return new Response(
+      JSON.stringify({ error: { message: 'invalid token' } }),
+      { status: 401, headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await expect(
+    client.beta.messages.create({
+      model: 'gpt-4',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 32,
+      stream: false,
+    }),
+  ).rejects.toMatchObject({ status: 401 })
+  expect(fetchCalls).toBe(2)
+})
 
 test('GitHub Copilot 401 chat_completions retries with refreshed token', async () => {
   const realModule = realGithubModelsCredentials

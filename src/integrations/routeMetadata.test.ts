@@ -7,6 +7,7 @@ import {
   getRouteDefaultModel,
   getRouteProviderTypeLabel,
   isCloudflareBaseUrl,
+  isLongcatBaseUrl,
   resolveActiveRouteIdFromEnv,
   resolveRouteCredentialValue,
   resolveRouteIdFromBaseUrl,
@@ -67,6 +68,28 @@ test('isCloudflareBaseUrl matches Workers AI host but not the shared AI Gateway'
   ).toBe(false)
 })
 
+test('isLongcatBaseUrl requires the documented HTTPS OpenAI API path', () => {
+  expect(isLongcatBaseUrl('https://api.longcat.chat/openai')).toBe(true)
+  expect(isLongcatBaseUrl('https://api.longcat.chat/openai/')).toBe(true)
+  expect(isLongcatBaseUrl('https://api.longcat.chat/openai/v1')).toBe(true)
+  expect(isLongcatBaseUrl('https://api.longcat.chat/openai/v1/chat/completions')).toBe(true)
+  expect(isLongcatBaseUrl('https://api.longcat.chat/openai/chat/completions')).toBe(true)
+  expect(isLongcatBaseUrl('https://api.longcat.chat/openai/other')).toBe(false)
+  expect(isLongcatBaseUrl('https://api.longcat.chat/openai/v1?query=value')).toBe(false)
+  expect(isLongcatBaseUrl('https://api.longcat.chat/openai/v1#fragment')).toBe(false)
+  expect(isLongcatBaseUrl('https://api.longcat.chat:8443/openai/v1')).toBe(false)
+  expect(isLongcatBaseUrl('http://api.longcat.chat/openai/v1')).toBe(false)
+  expect(isLongcatBaseUrl('https://api.longcat.chat/v1')).toBe(false)
+  expect(isLongcatBaseUrl('https://api.longcat.chat.evil.test/openai/v1')).toBe(false)
+})
+
+test('resolveActiveRouteIdFromEnv keeps generic OpenAI credentials ahead of env-only LongCat', () => {
+  expect(resolveActiveRouteIdFromEnv({
+    OPENAI_API_KEY: 'generic-key',
+    LONGCAT_API_KEY: 'longcat-key',
+  })).not.toBe('longcat')
+})
+
 test('getRouteProviderTypeLabel uses descriptor transport kinds for provider labels', () => {
   expect(getRouteProviderTypeLabel('anthropic')).toBe('Anthropic native API')
   expect(getRouteProviderTypeLabel('gemini')).toBe('Gemini API')
@@ -123,6 +146,64 @@ test('getRouteCredentialEnvVars keeps descriptor env vars and openai fallback fo
     'OPENAI_API_KEYS',
     'OPENAI_API_KEY',
   ])
+})
+
+test('custom Anthropic credentials stay native and resolve to their proxy route', () => {
+  expect(getRouteCredentialEnvVars('custom-anthropic')).toEqual([
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+  ])
+  expect(
+    resolveActiveRouteIdFromEnv({
+      ANTHROPIC_BASE_URL: 'https://tenant.example/v1',
+      ANTHROPIC_MODEL: 'tenant-model',
+      ANTHROPIC_AUTH_TOKEN: 'tenant-token',
+    }),
+  ).toBe('custom-anthropic')
+
+  expect(
+    resolveActiveRouteIdFromEnv({
+      ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+      ANTHROPIC_MODEL: 'claude-sonnet-4-6',
+      ANTHROPIC_AUTH_TOKEN: 'first-party-token',
+    }),
+  ).toBe('anthropic')
+
+  expect(
+    resolveActiveRouteIdFromEnv({
+      CLAUDE_CODE_USE_OPENAI: '1',
+      OPENAI_BASE_URL: 'https://api.openai.com/v1',
+      OPENAI_API_KEY: 'openai-key',
+      ANTHROPIC_BASE_URL: 'https://tenant.example/v1',
+      ANTHROPIC_MODEL: 'tenant-model',
+      ANTHROPIC_AUTH_TOKEN: 'tenant-token',
+    }),
+  ).toBe('openai')
+
+  expect(
+    resolveActiveRouteIdFromEnv({
+      ANTHROPIC_BASE_URL: 'https://tenant.example/v1',
+      ANTHROPIC_MODEL: 'tenant-model',
+      ANTHROPIC_API_KEY: 'tenant-key',
+    }),
+  ).toBe('custom-anthropic')
+
+  expect(
+    resolveActiveRouteIdFromEnv({
+      ANTHROPIC_BASE_URL: 'https://tenant.example/v1',
+      ANTHROPIC_MODEL: 'tenant-model',
+      ANTHROPIC_API_KEY: 'tenant-key',
+      MINIMAX_API_KEY: 'ambient-minimax-key',
+    }),
+  ).toBe('custom-anthropic')
+
+  expect(
+    resolveActiveRouteIdFromEnv({
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_MODEL: 'tenant-model',
+      ANTHROPIC_AUTH_TOKEN: 'tenant-token',
+    }),
+  ).toBe('custom-anthropic')
 })
 
 test('getRouteCredentialEnvVars omits the openai fallback for dedicatedCredentialsOnly routes', () => {
@@ -498,7 +579,7 @@ test.each([
   ['OpenRouter', 'https://openrouter.ai/api/v1', 'openai/gpt-5-mini', 'openrouter'],
   ['DeepSeek', 'https://api.deepseek.com/v1', 'deepseek-v4-pro', 'deepseek'],
   ['Hicap', 'https://api.hicap.ai/v1', 'claude-opus-4.8', 'hicap'],
-  ['AI/ML API', 'https://api.aimlapi.com/v1', 'gpt-4o', 'aimlapi'],
+  ['aimlapi.com', 'https://api.aimlapi.com/v1', 'gpt-4o', 'aimlapi'],
   ['Xiaomi MiMo', 'https://api.xiaomimimo.com/v1', 'mimo-v2.5-pro', 'xiaomi-mimo'],
   ['Venice', 'https://api.venice.ai/api/v1', 'venice-uncensored', 'venice'],
 ])(

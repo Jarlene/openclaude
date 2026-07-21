@@ -15,15 +15,19 @@
 import '../integrations/index.js'
 import {
   ensureIntegrationsLoaded,
+  getAnthropicProxy,
+  getAllAnthropicProxies,
   getAllGateways,
   getAllVendors,
   getGateway,
   getVendor,
   isCloudflareBaseUrl,
+  isLongcatBaseUrl,
   resolveProfileRoute,
   resolveRouteIdFromBaseUrl,
 } from '../integrations/index.js'
 import { PRESET_VENDOR_MAP } from '../integrations/compatibility.js'
+import { isFirstPartyAnthropicBaseUrlForEnv } from './anthropicBaseUrl.js'
 
 const PREFERRED_PROVIDER_ORDER = [
   'anthropic',
@@ -44,6 +48,7 @@ const PREFERRED_PROVIDER_ORDER = [
   'atlas-cloud',
   'nearai',
   'fireworks',
+  'longcat',
 ] as const
 
 function buildValidProviders(): string[] {
@@ -53,6 +58,7 @@ function buildValidProviders(): string[] {
     ...PRESET_VENDOR_MAP.map(mapping => mapping.preset),
     ...getAllVendors().map(vendor => vendor.id),
     ...getAllGateways().map(gateway => gateway.id),
+    ...getAllAnthropicProxies().map(proxy => proxy.id),
   ])
 
   const preferred = PREFERRED_PROVIDER_ORDER.filter(provider =>
@@ -150,11 +156,12 @@ function getRouteDefaults(provider: string): {
   const gateway =
     (route.gatewayId ? getGateway(route.gatewayId) : undefined) ??
     getGateway(route.routeId)
+  const anthropicProxy = getAnthropicProxy(route.routeId)
 
-  const defaultModel = gateway?.defaultModel ?? vendor?.defaultModel
+  const defaultModel = gateway?.defaultModel ?? vendor?.defaultModel ?? anthropicProxy?.defaultModel
 
   return {
-    defaultBaseUrl: gateway?.defaultBaseUrl ?? vendor?.defaultBaseUrl,
+    defaultBaseUrl: gateway?.defaultBaseUrl ?? vendor?.defaultBaseUrl ?? anthropicProxy?.defaultBaseUrl,
     defaultModel,
   }
 }
@@ -315,6 +322,9 @@ export function applyProviderFlag(
                         process.env.OPENAI_API_KEY === process.env.FIREWORKS_API_KEY
                       ? 'fireworks'
                       : process.env.OPENAI_API_KEY !== undefined &&
+                        process.env.OPENAI_API_KEY === process.env.LONGCAT_API_KEY
+                      ? 'longcat'
+                      : process.env.OPENAI_API_KEY !== undefined &&
                       opengatewayApiKey !== undefined &&
                       opengatewayApiKey.length > 0 &&
                       process.env.OPENAI_API_KEY === opengatewayApiKey
@@ -330,6 +340,7 @@ export function applyProviderFlag(
   delete process.env.CLAUDE_CODE_USE_GITHUB
   delete process.env.CLAUDE_CODE_USE_BEDROCK
   delete process.env.CLAUDE_CODE_USE_VERTEX
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY
   delete process.env.NVIDIA_NIM
   if (copiedOpenAIKeyProvider && provider !== copiedOpenAIKeyProvider) {
     delete process.env.OPENAI_API_KEY
@@ -338,9 +349,64 @@ export function applyProviderFlag(
   const model = parseModelFlag(args)
   const { defaultBaseUrl, defaultModel } = getRouteDefaults(provider)
 
+  // Azure-style routing changes both request paths and authentication. It is
+  // only meaningful for an explicit OpenAI/Azure configuration, so never let
+  // it follow a provider switch to another OpenAI-compatible endpoint.
+  if (provider !== 'openai') {
+    delete process.env.OPENAI_AZURE_STYLE
+  }
+
   switch (provider) {
-    case 'anthropic':
-      // Default — no env vars needed
+    case 'anthropic': {
+      // Default — clear any custom native proxy contract so this explicit
+      // provider flag cannot keep routing requests to a prior endpoint.
+      // Preserve a first-party API key: it is the normal credential for this
+      // provider and may have been supplied directly through the environment.
+      const hadCustomAnthropicEndpoint =
+        !isFirstPartyAnthropicBaseUrlForEnv(process.env)
+      delete process.env.ANTHROPIC_BASE_URL
+      delete process.env.ANTHROPIC_MODEL
+      if (hadCustomAnthropicEndpoint) {
+        delete process.env.ANTHROPIC_API_KEY
+      }
+      delete process.env.ANTHROPIC_AUTH_TOKEN
+      delete process.env.ANTHROPIC_CUSTOM_HEADERS
+      break
+    }
+
+    case 'custom-anthropic':
+      if (!process.env.ANTHROPIC_BASE_URL?.trim()) {
+        return {
+          error: 'Custom Anthropic-compatible provider requires ANTHROPIC_BASE_URL.',
+        }
+      }
+      if (isFirstPartyAnthropicBaseUrlForEnv(process.env)) {
+        return {
+          error: 'Custom Anthropic-compatible provider requires a non-Anthropic ANTHROPIC_BASE_URL.',
+        }
+      }
+      const hasAuthToken = Boolean(process.env.ANTHROPIC_AUTH_TOKEN?.trim())
+      const hasApiKey = Boolean(process.env.ANTHROPIC_API_KEY?.trim())
+      if (!hasAuthToken && !hasApiKey) {
+        return {
+          error: 'Custom Anthropic-compatible provider requires ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY.',
+        }
+      }
+      if (hasAuthToken) {
+        delete process.env.ANTHROPIC_API_KEY
+      } else {
+        delete process.env.ANTHROPIC_AUTH_TOKEN
+      }
+      delete process.env.OPENAI_BASE_URL
+      delete process.env.OPENAI_API_BASE
+      delete process.env.OPENAI_MODEL
+      delete process.env.OPENAI_API_FORMAT
+      delete process.env.OPENAI_AZURE_STYLE
+      delete process.env.OPENAI_AUTH_HEADER
+      delete process.env.OPENAI_AUTH_SCHEME
+      delete process.env.OPENAI_AUTH_HEADER_VALUE
+      process.env.ANTHROPIC_MODEL ??= defaultModel
+      if (model) process.env.ANTHROPIC_MODEL = model
       break
 
     case 'openai':
@@ -406,6 +472,7 @@ export function applyProviderFlag(
       delete process.env.OPENAI_API_BASE
       delete process.env.OPENAI_MODEL
       delete process.env.OPENAI_API_FORMAT
+      delete process.env.OPENAI_AZURE_STYLE
       delete process.env.OPENAI_AUTH_HEADER
       delete process.env.OPENAI_AUTH_SCHEME
       delete process.env.OPENAI_AUTH_HEADER_VALUE
@@ -522,6 +589,34 @@ export function applyProviderFlag(
       if (model) process.env.OPENAI_MODEL = model
       if (process.env.FIREWORKS_API_KEY) {
         process.env.OPENAI_API_KEY = process.env.FIREWORKS_API_KEY
+      } else {
+        delete process.env.OPENAI_API_KEY
+      }
+      break
+
+    case 'longcat':
+      process.env.CLAUDE_CODE_USE_OPENAI = '1'
+      // LongCat only implements its documented chat-completions endpoint and
+      // Bearer authentication. Do not let stale OpenAI-compatible settings
+      // from a previously selected provider change that wire contract.
+      delete process.env.OPENAI_API_FORMAT
+      delete process.env.OPENAI_AUTH_HEADER
+      delete process.env.OPENAI_AUTH_SCHEME
+      delete process.env.OPENAI_AUTH_HEADER_VALUE
+      applyOpenAIBaseUrlDefault(
+        provider,
+        defaultBaseUrl ?? 'https://api.longcat.chat/openai/v1',
+      )
+      process.env.OPENAI_MODEL ??= defaultModel ?? 'LongCat-2.0'
+      if (model) process.env.OPENAI_MODEL = model
+      // Do not copy a dedicated LongCat credential to a stale custom URL.
+      // applyOpenAIBaseUrlDefault preserves an existing base URL, so only
+      // expose this key when that URL is the documented HTTPS LongCat API.
+      if (
+        process.env.LONGCAT_API_KEY &&
+        isLongcatBaseUrl(getConfiguredOpenAIBaseUrl())
+      ) {
+        process.env.OPENAI_API_KEY = process.env.LONGCAT_API_KEY
       } else {
         delete process.env.OPENAI_API_KEY
       }

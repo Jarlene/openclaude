@@ -13,10 +13,14 @@ import {
 } from '../test/sharedMutationLock.js'
 
 type SettingsModule = typeof import('../utils/settings/settings.js')
+type ProviderStartupOverridesModule = typeof import('../utils/providerStartupOverrides.js')
 
 const actualSettingsModule = (await import(
   `../utils/settings/settings.ts?providerManagerSettingsActual=${Date.now()}-${Math.random()}`
 )) as SettingsModule
+const actualProviderStartupOverridesModule = (await import(
+  `../utils/providerStartupOverrides.ts?providerManagerStartupOverridesActual=${Date.now()}-${Math.random()}`
+)) as ProviderStartupOverridesModule
 
 const SYNC_START = '\x1B[?2026h'
 const SYNC_END = '\x1B[?2026l'
@@ -111,7 +115,7 @@ async function waitForCondition(
 
 // Provider list is sorted from generated preset metadata by description, with
 // Gitlawb Opengateway pinned first, Anthropic second, Codex OAuth injected
-// after DeepSeek, and Custom always pinned last. Keep the target-by-label
+// after DeepSeek, and the custom endpoints always pinned last. Keep the target-by-label
 // indirection here so
 // these tests survive future list edits without hardcoding raw key counts.
 //
@@ -119,8 +123,8 @@ async function waitForCondition(
 // canUseCodexOAuth === true (default in mocked tests).
 const PRESET_ORDER = [
   'Gitlawb Opengateway',
+  'aimlapi.com',
   'Anthropic',
-  'AI/ML API',
   'Alibaba Coding Plan (China)',
   'Alibaba Coding Plan',
   'Atlas Cloud',
@@ -138,6 +142,7 @@ const PRESET_ORDER = [
   'LM Studio',
   'Atomic Chat',
   'Ollama',
+  'LongCat',
   'MiniMax',
   'Mistral AI',
   'Moonshot AI - API',
@@ -154,7 +159,8 @@ const PRESET_ORDER = [
   'Xiaomi MiMo',
   'Xiaomi MiMo (Token Plan)',
   'Z.AI - GLM Coding Plan',
-  'Custom',
+  'Custom (OpenAI-compatible)',
+  'Custom (Anthropic-compatible)',
 ] as const
 
 async function navigateToPreset(
@@ -226,6 +232,17 @@ function mockProviderProfilesModule(options?: {
         }
       }
 
+      if (preset === 'custom-anthropic') {
+        return {
+          provider: 'custom-anthropic',
+          name: 'Custom (Anthropic-compatible)',
+          baseUrl: 'https://anthropic-proxy.example',
+          model: 'claude-sonnet-4-6',
+          apiKey: '',
+          requiresApiKey: true,
+        }
+      }
+
       if (preset === 'azure-openai') {
         return {
           provider: 'azure-openai',
@@ -251,7 +268,7 @@ function mockProviderProfilesModule(options?: {
       if (preset === 'aimlapi') {
         return {
           provider: 'aimlapi',
-          name: 'AI/ML API',
+          name: 'aimlapi.com',
           baseUrl: 'https://api.aimlapi.com/v1',
           model: 'gpt-4o',
           apiKey: '',
@@ -447,7 +464,7 @@ function mockProviderManagerDependencies(
     provisionAimlapiKey:
       options?.provisionAimlapiKey ??
       (async () => {
-        throw new Error('Unexpected AI/ML API top-up in test')
+        throw new Error('Unexpected aimlapi.com top-up in test')
       }),
   }))
 
@@ -562,6 +579,7 @@ afterEach(() => {
   try {
     mock.restore()
     mock.module('../utils/settings/settings.js', () => actualSettingsModule)
+    mock.module('../utils/providerStartupOverrides.js', () => actualProviderStartupOverridesModule)
 
     for (const [key, value] of Object.entries(ORIGINAL_ENV)) {
       if (value === undefined) {
@@ -663,7 +681,7 @@ test('ProviderManager shows API mode picker for custom OpenAI-compatible provide
       frame.includes('Choose provider preset'),
     )
 
-    await navigateToPreset(mounted.stdin, 'Custom')
+    await navigateToPreset(mounted.stdin, 'Custom (OpenAI-compatible)')
     mounted.stdin.write('\r')
     await waitForFrameOutput(mounted.getOutput, frame =>
       frame.includes('Create provider profile') &&
@@ -681,9 +699,60 @@ test('ProviderManager shows API mode picker for custom OpenAI-compatible provide
     mounted.stdin.write('\r')
 
     const output = await waitForFrameOutput(mounted.getOutput, frame =>
-      frame.includes('API mode') && frame.includes('Chat Completions'),
+      frame.includes('API mode') && frame.includes('Automatic'),
     )
     expect(output).toContain('Responses')
+  } finally {
+    await mounted.dispose()
+  }
+})
+
+test('ProviderManager offers a token field for custom Anthropic-compatible providers', async () => {
+  mockProviderManagerDependencies(() => undefined, async () => undefined)
+
+  const nonce = `${Date.now()}-${Math.random()}`
+  const { ProviderManager } = await import(`./ProviderManager.js?ts=${nonce}`)
+  const mounted = await mountProviderManager(ProviderManager)
+
+  try {
+    await waitForFrameOutput(mounted.getOutput, frame =>
+      frame.includes('Provider manager'),
+    )
+    mounted.stdin.write('\r')
+    await waitForFrameOutput(mounted.getOutput, frame =>
+      frame.includes('Choose provider preset'),
+    )
+    await navigateToPreset(mounted.stdin, 'Custom (Anthropic-compatible)')
+    mounted.stdin.write('\r')
+    await waitForFrameOutput(mounted.getOutput, frame => frame.includes('Provider name'))
+    mounted.stdin.write('\r')
+    await waitForFrameOutput(mounted.getOutput, frame => frame.includes('Base URL'))
+    mounted.stdin.write('\r')
+    await waitForFrameOutput(mounted.getOutput, frame => frame.includes('Default model'))
+    mounted.stdin.write('\r')
+
+    const output = await waitForFrameOutput(mounted.getOutput, frame =>
+      frame.includes('Credential') && frame.includes('Anthropic-compatible API'),
+    )
+    expect(output).not.toContain('API mode')
+    mounted.stdin.write('\r')
+    const requiredOutput = await waitForFrameOutput(mounted.getOutput, frame =>
+      frame.includes('Credential is required.'),
+    )
+    expect(requiredOutput).toContain('Credential is required.')
+    mounted.stdin.write('proxy-token')
+    mounted.stdin.write('\r')
+    const headersOutput = await waitForFrameOutput(mounted.getOutput, frame =>
+      frame.includes('Custom headers'),
+    )
+    expect(headersOutput).toContain('Extra non-auth request headers')
+    mounted.stdin.write('\r')
+    const placeholderError = await waitForFrameOutput(mounted.getOutput, frame =>
+      frame.includes('Base URL must be a real Anthropic-compatible endpoint.'),
+    )
+    expect(placeholderError).toContain(
+      'Base URL must be a real Anthropic-compatible endpoint.',
+    )
   } finally {
     await mounted.dispose()
   }
@@ -853,7 +922,7 @@ test('ProviderManager saves OpenAI preset GPT-5 models with Responses API', asyn
   }
 })
 
-test('ProviderManager saves AI/ML API preset with OpenAI-compatible defaults', async () => {
+test('ProviderManager saves aimlapi.com preset with OpenAI-compatible defaults', async () => {
   const addProviderProfile = mock((payload: any) => ({
     id: 'aimlapi_profile',
     ...payload,
@@ -877,14 +946,14 @@ test('ProviderManager saves AI/ML API preset with OpenAI-compatible defaults', a
       frame.includes('Choose provider preset'),
     )
 
-    await navigateToPreset(mounted.stdin, 'AI/ML API')
+    await navigateToPreset(mounted.stdin, 'aimlapi.com')
     mounted.stdin.write('\r')
     const modelOutput = await waitForFrameOutput(mounted.getOutput, frame =>
       frame.includes('Create provider profile') &&
       frame.includes('Step 1 of 2: Default model'),
     )
 
-    expect(modelOutput).toContain('AI/ML API')
+    expect(modelOutput).toContain('aimlapi.com')
     expect(modelOutput).toContain('gpt-4o')
     expect(modelOutput).not.toContain('Provider name')
     expect(modelOutput).not.toContain('Base URL')
@@ -900,7 +969,7 @@ test('ProviderManager saves AI/ML API preset with OpenAI-compatible defaults', a
     await Bun.sleep(25)
     mounted.stdin.write('\r')
     await waitForFrameOutput(mounted.getOutput, frame =>
-      frame.includes('Enter the API key for AI/ML API'),
+      frame.includes('Enter the API key for aimlapi.com'),
     )
 
     mounted.stdin.write('aimlapi-test-key')
@@ -911,7 +980,7 @@ test('ProviderManager saves AI/ML API preset with OpenAI-compatible defaults', a
     expect(addProviderProfile).toHaveBeenCalledWith(
       expect.objectContaining({
         provider: 'aimlapi',
-        name: 'AI/ML API',
+        name: 'aimlapi.com',
         baseUrl: 'https://api.aimlapi.com/v1',
         model: 'gpt-4o',
         apiKey: 'aimlapi-test-key',
@@ -924,7 +993,7 @@ test('ProviderManager saves AI/ML API preset with OpenAI-compatible defaults', a
   }
 })
 
-test('ProviderManager can top up AI/ML API and save the issued key', async () => {
+test('ProviderManager can top up aimlapi.com and save the issued key', async () => {
   delete process.env.AIMLAPI_EMAIL
   delete process.env.AIMLAPI_PASSWORD
 
@@ -964,7 +1033,7 @@ test('ProviderManager can top up AI/ML API and save the issued key', async () =>
       frame.includes('Choose provider preset'),
     )
 
-    await navigateToPreset(mounted.stdin, 'AI/ML API')
+    await navigateToPreset(mounted.stdin, 'aimlapi.com')
     mounted.stdin.write('\r')
     await waitForFrameOutput(mounted.getOutput, frame =>
       frame.includes('Step 1 of 2: Default model'),
@@ -977,14 +1046,14 @@ test('ProviderManager can top up AI/ML API and save the issued key', async () =>
 
     mounted.stdin.write('\r')
     await waitForFrameOutput(mounted.getOutput, frame =>
-      frame.includes('Enter your AI/ML API account email'),
+      frame.includes('Enter your aimlapi.com account email'),
     )
     mounted.stdin.write('user@example.com')
     await Bun.sleep(25)
     mounted.stdin.write('\r')
 
     await waitForFrameOutput(mounted.getOutput, frame =>
-      frame.includes('Enter your AI/ML API password'),
+      frame.includes('Enter your aimlapi.com password'),
     )
     mounted.stdin.write('secret-password')
     await Bun.sleep(25)
@@ -1019,7 +1088,7 @@ test('ProviderManager can top up AI/ML API and save the issued key', async () =>
     expect(addProviderProfile).toHaveBeenCalledWith(
       expect.objectContaining({
         provider: 'aimlapi',
-        name: 'AI/ML API',
+        name: 'aimlapi.com',
         baseUrl: 'https://api.aimlapi.com/v1',
         model: 'gpt-4o',
         apiKey: 'aimlapi-issued-key',

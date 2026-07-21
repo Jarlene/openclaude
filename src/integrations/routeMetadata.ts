@@ -6,16 +6,19 @@ import type {
 } from './descriptors.js'
 import {
   ensureIntegrationsLoaded,
+  getAllAnthropicProxies,
   getAllGateways,
   getAllVendors,
   getGateway,
+  getAnthropicProxy,
   getVendor,
   resolveProfileRoute,
 } from './index.js'
 import { hasUsableOpenAICredential } from '../services/api/credentialPool.js'
 import { isEnvTruthy } from '../utils/envUtils.js'
+import { isFirstPartyAnthropicBaseUrlForEnv } from '../utils/anthropicBaseUrl.js'
 
-export type RouteDescriptor = GatewayDescriptor | VendorDescriptor
+export type RouteDescriptor = GatewayDescriptor | VendorDescriptor | import('./descriptors.js').AnthropicProxyDescriptor
 
 const TRANSPORT_KIND_PROVIDER_TYPE_LABELS: Partial<
   Record<TransportKind, string>
@@ -60,7 +63,7 @@ export function matchHostnameAgainstRouteHosts(
   })
 }
 
-function normalizeComparableBaseUrl(
+export function normalizeComparableBaseUrl(
   baseUrl?: string,
 ): string | null {
   if (!baseUrl?.trim()) {
@@ -93,7 +96,7 @@ function normalizeHost(
 
 function getAllRoutes(): RouteDescriptor[] {
   ensureIntegrationsLoaded()
-  return [...getAllGateways(), ...getAllVendors()]
+  return [...getAllGateways(), ...getAllVendors(), ...getAllAnthropicProxies()]
 }
 
 function resolveKnownLocalRouteIdFromBaseUrl(baseUrl?: string): string | null {
@@ -129,7 +132,7 @@ export function getRouteDescriptor(
   routeId: string,
 ): RouteDescriptor | null {
   ensureIntegrationsLoaded()
-  return getGateway(routeId) ?? getVendor(routeId) ?? null
+  return getGateway(routeId) ?? getVendor(routeId) ?? getAnthropicProxy(routeId) ?? null
 }
 
 export function getRouteLabel(
@@ -365,6 +368,27 @@ export function isFireworksBaseUrl(value: string | undefined): boolean {
   }
 }
 
+export function isLongcatBaseUrl(value: string | undefined): boolean {
+  const trimmed = value?.trim()
+  if (!trimmed) {
+    return false
+  }
+
+  try {
+    const url = new URL(trimmed)
+    return (
+      url.protocol === 'https:' &&
+      url.hostname.toLowerCase() === 'api.longcat.chat' &&
+      !url.port &&
+      !url.search &&
+      !url.hash &&
+      /^\/openai(?:\/v1)?(?:\/chat\/completions)?\/?$/.test(url.pathname)
+    )
+  } catch {
+    return false
+  }
+}
+
 export function isClinePassBaseUrl(value: string | undefined): boolean {
   const trimmed = value?.trim()
   if (!trimmed) {
@@ -483,6 +507,23 @@ export function getFireworksBaseUrlOverride(
 
   return undefined
 }
+
+export function getLongcatBaseUrlOverride(
+  processEnv: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const openAIBaseUrl = processEnv.OPENAI_BASE_URL?.trim()
+  if (isLongcatBaseUrl(openAIBaseUrl)) {
+    return openAIBaseUrl
+  }
+
+  const openAIApiBase = processEnv.OPENAI_API_BASE?.trim()
+  if (isLongcatBaseUrl(openAIApiBase)) {
+    return openAIApiBase
+  }
+
+  return undefined
+}
+
 export function getMiniMaxBaseUrlOverride(
   processEnv: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
@@ -661,6 +702,7 @@ export function hasNearaiEnvOnlyProviderIntent(
     !hasNonEmptyEnvValue(processEnv.VENICE_API_KEY) &&
     !hasNonEmptyEnvValue(processEnv.MIMO_API_KEY) &&
     !hasNonEmptyEnvValue(processEnv.FIREWORKS_API_KEY) &&
+    !hasNonEmptyEnvValue(processEnv.LONGCAT_API_KEY) &&
     !hasNonEmptyEnvValue(processEnv.CLINE_API_KEY) &&
     !hasConflictingOpenAIBaseUrlForRoute(processEnv, isNearaiBaseUrl) &&
     hasNoExplicitNonOpenAICompatibleProvider(processEnv)
@@ -682,8 +724,27 @@ export function hasFireworksEnvOnlyProviderIntent(
     !hasNonEmptyEnvValue(processEnv.VENICE_API_KEY) &&
     !hasNonEmptyEnvValue(processEnv.MIMO_API_KEY) &&
     !hasNonEmptyEnvValue(processEnv.NEARAI_API_KEY) &&
+    !hasNonEmptyEnvValue(processEnv.LONGCAT_API_KEY) &&
     !hasNonEmptyEnvValue(processEnv.CLINE_API_KEY) &&
     !hasConflictingOpenAIBaseUrlForRoute(processEnv, isFireworksBaseUrl) &&
+    hasNoExplicitNonOpenAICompatibleProvider(processEnv)
+  )
+}
+
+export function hasLongcatEnvOnlyProviderIntent(
+  processEnv: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    hasNonEmptyEnvValue(processEnv.LONGCAT_API_KEY) &&
+    !hasAnyUsableOpenAICredential(processEnv) &&
+    !hasNonEmptyEnvValue(processEnv.XAI_API_KEY) &&
+    !hasNonEmptyEnvValue(processEnv.MINIMAX_API_KEY) &&
+    !hasNonEmptyEnvValue(processEnv.VENICE_API_KEY) &&
+    !hasNonEmptyEnvValue(processEnv.MIMO_API_KEY) &&
+    !hasNonEmptyEnvValue(processEnv.NEARAI_API_KEY) &&
+    !hasNonEmptyEnvValue(processEnv.FIREWORKS_API_KEY) &&
+    !hasNonEmptyEnvValue(processEnv.CLINE_API_KEY) &&
+    !hasConflictingOpenAIBaseUrlForRoute(processEnv, isLongcatBaseUrl) &&
     hasNoExplicitNonOpenAICompatibleProvider(processEnv)
   )
 }
@@ -713,6 +774,7 @@ export function resolveEnvOnlyProviderRouteId(
   | 'xiaomi-mimo'
   | 'nearai'
   | 'fireworks'
+  | 'longcat'
   | 'clinepass'
   | null {
   if (
@@ -748,6 +810,10 @@ export function resolveEnvOnlyProviderRouteId(
 
   if (hasFireworksEnvOnlyProviderIntent(processEnv)) {
     return 'fireworks'
+  }
+
+  if (hasLongcatEnvOnlyProviderIntent(processEnv)) {
+    return 'longcat'
   }
 
   if (hasClinePassEnvOnlyProviderIntent(processEnv)) {
@@ -829,7 +895,10 @@ export function routeSupportsCustomHeaders(
     return false
   }
 
-  return descriptor.transportConfig.openaiShim?.supportsAuthHeaders === true
+  return (
+    descriptor.transportConfig.openaiShim?.supportsAuthHeaders === true ||
+    descriptor.transportConfig.anthropicProxy?.supportsCustomHeaders === true
+  )
 }
 
 export function routeShowsAuthHeaderValue(routeId: string): boolean {
@@ -933,7 +1002,10 @@ export function resolveRouteIdFromBaseUrl(
         // bare hostname match isn't enough for the Workers AI route — require
         // the Workers AI path (/client/v4/accounts/<id>/ai/v1). Otherwise an
         // unrelated Cloudflare API URL would inherit Workers-AI routing.
-        if (route.id === 'cloudflare' && !isCloudflareBaseUrl(baseUrl)) {
+        if (
+          (route.id === 'cloudflare' && !isCloudflareBaseUrl(baseUrl)) ||
+          (route.id === 'longcat' && !isLongcatBaseUrl(baseUrl))
+        ) {
           continue
         }
         return route.id
@@ -966,6 +1038,9 @@ function profileRouteHonorsBaseUrlBoundary(
   if (routeId === 'cloudflare') {
     return isCloudflareBaseUrl(baseUrl)
   }
+  if (routeId === 'longcat') {
+    return isLongcatBaseUrl(baseUrl)
+  }
   return true
 }
 
@@ -990,6 +1065,26 @@ export function resolveActiveRouteIdFromEnv(
   }
   if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_VERTEX)) {
     return 'vertex'
+  }
+
+  // A Bearer token explicitly selects the custom Anthropic proxy contract,
+  // even if the host also belongs to a known OpenAI-compatible route. Keep
+  // native x-api-key configurations on those known routes for compatibility.
+  const knownAnthropicRoute = resolveRouteIdFromBaseUrl(
+    processEnv.ANTHROPIC_BASE_URL,
+  )
+  if (
+    !isEnvTruthy(processEnv.CLAUDE_CODE_USE_OPENAI) &&
+    hasNonEmptyEnvValue(processEnv.ANTHROPIC_BASE_URL) &&
+    hasNonEmptyEnvValue(processEnv.ANTHROPIC_MODEL) &&
+    (hasNonEmptyEnvValue(processEnv.ANTHROPIC_AUTH_TOKEN) ||
+      hasNonEmptyEnvValue(processEnv.ANTHROPIC_API_KEY)) &&
+    !isFirstPartyAnthropicBaseUrlForEnv(processEnv) &&
+    (hasNonEmptyEnvValue(processEnv.ANTHROPIC_AUTH_TOKEN) ||
+      knownAnthropicRoute === 'custom-anthropic' ||
+      !knownAnthropicRoute)
+  ) {
+    return 'custom-anthropic'
   }
 
   const envOnlyRouteId = resolveEnvOnlyProviderRouteId(processEnv)

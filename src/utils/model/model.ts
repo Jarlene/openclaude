@@ -23,7 +23,12 @@ import { getModelStrings, resolveOverriddenModel } from './modelStrings.js'
 import { formatModelPricing, getOpus46CostTier } from '../modelCost.js'
 import { getSettings_DEPRECATED } from '../settings/settings.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
-import { getAPIProvider } from './providers.js'
+import {
+  getAPIProvider,
+  isFirstPartyAnthropicBaseUrl,
+  isFirstPartyAnthropicProvider,
+  isCustomAnthropicProvider,
+} from './providers.js'
 import { LIGHTNING_BOLT } from '../../constants/figures.js'
 import { isModelAllowed } from './modelAllowlist.js'
 import { type ModelAlias, isModelAlias } from './aliases.js'
@@ -48,6 +53,9 @@ function normalizeModelSetting(value: unknown): ModelName | ModelAlias | undefin
 
 export function getSmallFastModel(): ModelName {
   if (process.env.ANTHROPIC_SMALL_FAST_MODEL) return process.env.ANTHROPIC_SMALL_FAST_MODEL
+  if (isCustomAnthropicProvider()) {
+    return process.env.ANTHROPIC_MODEL || getDefaultHaikuModel()
+  }
   // For Gemini provider, use a fast model
   if (getAPIProvider() === 'gemini') {
     return process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite'
@@ -226,7 +234,7 @@ export function getDefaultOpusModel(): ModelName {
   // 3P providers (Bedrock, Vertex, Foundry) — kept as a separate branch
   // since 3P availability lags firstParty and these will diverge again at
   // the next model launch. Keep 3P on Opus 4.7 until they roll out 4.8.
-  if (getAPIProvider() !== 'firstParty') {
+  if (!isFirstPartyAnthropicProvider()) {
     return getModelStrings().opus47
   }
   return getModelStrings().opus48
@@ -274,7 +282,7 @@ export function getDefaultSonnetModel(): ModelName {
     return process.env.OPENAI_MODEL || 'grok-4.3'
   }
   // Default to Sonnet 4.5 for 3P since they may not have 4.6 yet
-  if (getAPIProvider() !== 'firstParty') {
+  if (!isFirstPartyAnthropicProvider()) {
     return getModelStrings().sonnet45
   }
   return getModelStrings().sonnet46
@@ -365,6 +373,12 @@ export function getRuntimeMainLoopModel(params: {
  * @returns The default model setting to use
  */
 export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
+  // Custom Anthropic-compatible endpoints intentionally retain the legacy
+  // firstParty provider category, so prefer their explicitly configured model
+  // before the subscription and PAYG defaults below.
+  if (isCustomAnthropicProvider()) {
+    return process.env.ANTHROPIC_MODEL || getDefaultSonnetModel()
+  }
   // GitHub Copilot provider: check settings.model first, then env, then default
   if (getAPIProvider() === 'github') {
     const settings = getSettings_DEPRECATED() || {}
@@ -549,7 +563,7 @@ export function renderDefaultModelSetting(
 }
 
 export function getOpus46PricingSuffix(fastMode: boolean): string {
-  if (getAPIProvider() !== 'firstParty') return ''
+  if (!isFirstPartyAnthropicProvider()) return ''
   const pricing = formatModelPricing(getOpus46CostTier(fastMode))
   const fastModeIndicator = fastMode ? ` (${LIGHTNING_BOLT})` : ''
   return ` ·${fastModeIndicator} ${pricing}`
@@ -559,7 +573,7 @@ export function isOpus1mMergeEnabled(): boolean {
   if (
     is1mContextDisabled() ||
     isProSubscriber() ||
-    getAPIProvider() !== 'firstParty'
+    !isFirstPartyAnthropicProvider()
   ) {
     return false
   }
@@ -613,6 +627,9 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
   ) {
     // Return display names for known GitHub Copilot models
     const copilotModelNames: Record<string, string> = {
+      'gpt-5.6-sol': 'GPT-5.6 Sol',
+      'gpt-5.6-terra': 'GPT-5.6 Terra',
+      'gpt-5.6-luna': 'GPT-5.6 Luna',
       'gpt-5.5': 'GPT-5.5',
       'gpt-5.5-mini': 'GPT-5.5 mini',
       'gpt-5.4': 'GPT-5.4',
@@ -645,6 +662,12 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
     return null
   }
   switch (model) {
+    case 'gpt-5.6-sol':
+      return 'GPT-5.6 Sol'
+    case 'gpt-5.6-terra':
+      return 'GPT-5.6 Terra'
+    case 'gpt-5.6-luna':
+      return 'GPT-5.6 Luna'
     case 'gpt-5.5':
       return 'GPT-5.5'
     case 'gpt-5.4':
@@ -817,6 +840,19 @@ export function parseUserSpecifiedModel(
   if (modelString === 'codexspark') {
     return 'gpt-5.3-codex-spark' + (has1mTag ? '[1m]' : '')
   }
+  // Bare gpt-5.6 resolves to the flagship tier (Sol), like the Codex CLI.
+  // Resolving here — not just in the request-time alias map — keeps the
+  // runtime model id on the tier that has real descriptor metadata, so
+  // context-window sizing and display names don't fall back to defaults.
+  // Match on the base name so a ?reasoning=/?thinking= query suffix does not
+  // defeat the rewrite; the query is preserved on the resolved tier id and a
+  // [1m] tag stays TRAILING (after the query, mirroring the input form) so
+  // downstream query parsing sees `?reasoning=...` intact — request-time
+  // parsing (parseModelDescriptor) strips the trailing tag itself.
+  if (modelString === 'gpt-5.6' || modelString.startsWith('gpt-5.6?')) {
+    const query = modelString.slice('gpt-5.6'.length)
+    return 'gpt-5.6-sol' + query + (has1mTag ? '[1m]' : '')
+  }
 
   // Opus 4/4.1 are no longer available on the first-party API (same as
   // Claude.ai) — silently remap to the current Opus default. The 'opus'
@@ -825,6 +861,7 @@ export function parseUserSpecifiedModel(
   // 3P providers may not yet have 4.6 capacity, so pass through unchanged.
   if (
     getAPIProvider() === 'firstParty' &&
+    isFirstPartyAnthropicBaseUrl() &&
     isLegacyOpusFirstParty(modelString) &&
     isLegacyModelRemapEnabled()
   ) {
@@ -909,7 +946,7 @@ export function isLegacyModelRemapEnabled(): boolean {
 
 export function modelDisplayString(model: ModelSetting): string {
   if (model === null) {
-    if (getAPIProvider() !== 'firstParty') {
+    if (!isFirstPartyAnthropicProvider()) {
       return `Default (${getDefaultMainLoopModel()})`
     }
     if (process.env.USER_TYPE === 'ant') {

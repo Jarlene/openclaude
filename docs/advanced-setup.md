@@ -409,6 +409,26 @@ already present as dev dependencies, so source/dev builds need no extra steps.
 
 ## Environment Variables
 
+### Custom (Anthropic-compatible) APIs
+
+For an endpoint that accepts Anthropic's native Messages API, set its base URL,
+Bearer token, and model directly. Do not set `CLAUDE_CODE_USE_OPENAI`; that
+selects the OpenAI-compatible transport instead.
+
+```bash
+export ANTHROPIC_BASE_URL=https://anthropic-proxy.example
+export ANTHROPIC_AUTH_TOKEN=your-provider-token
+export ANTHROPIC_MODEL=your-model-name
+openclaude
+```
+
+`ANTHROPIC_AUTH_TOKEN` is sent as `Authorization: Bearer ...`. The
+`/provider` → `Add provider` menu uses that Bearer-token setup as **Custom
+(Anthropic-compatible)**, including optional extra request headers. For a
+directly configured endpoint that instead requires Anthropic's native
+`x-api-key` authentication, set `ANTHROPIC_API_KEY` in place of the Bearer
+token; do not set both credentials.
+
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `CLAUDE_CODE_USE_OPENAI` | OpenAI-compatible only | Set to `1` to enable the OpenAI-compatible provider path |
@@ -417,6 +437,7 @@ already present as dev dependencies, so source/dev builds need no extra steps.
 | `OPENAI_MODEL` | OpenAI-compatible only | Model name such as `gpt-4o`, `deepseek-v4-flash`, or `llama3.3:70b` |
 | `OPENAI_BASE_URL` | No | API endpoint, defaulting to `https://api.openai.com/v1` |
 | `OPENAI_API_BASE` | No | Compatibility alias for `OPENAI_BASE_URL` |
+| `API_TIMEOUT_MS` | No | Time-to-response-headers deadline for generic OpenAI-compatible requests, direct GitHub Copilot Responses, and Copilot chat-to-Responses fallback requests, in milliseconds (default: `600000`, or 10 minutes). The value must be a safe positive integer; invalid, zero, negative, or fractional values use the default, and values above `2147483647` are capped. The deadline is disarmed after headers arrive, so it does not limit response streaming. Export this runtime setting from your shell or launcher; the provider env-file loader ignores runtime/debug settings, so a value configured only there leaves the default in effect. First-party Codex OAuth Responses and the Anthropic SDK retain their existing timeout handling. |
 | `OPENCLAUDE_OLLAMA_NUM_CTX` | Ollama only | Request-level Ollama context window. Defaults to `32768`; set a larger value for longer same-session history if your model and hardware can handle it. |
 | `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` | No | JSON map of OpenAI-compatible model names to context windows, such as `{"custom-model":1000000}`. Use this when a custom provider does not expose context metadata from `/v1/models`. |
 | `CLAUDE_CODE_OPENAI_MAX_OUTPUT_TOKENS` | No | JSON map of OpenAI-compatible model names to max output tokens, such as `{"custom-model":32768}`. Use this when a custom provider does not expose output-limit metadata from `/v1/models`. |
@@ -665,21 +686,22 @@ would otherwise prevent it. Set `OPENCLAUDE_MAX_ACTIVE_MESSAGES_HARD_CAP=0`
 only when you need to suppress that safety cap for diagnostics.
 
 If you frequently resume long sessions that accumulate hundreds of small
-tool-result messages with negligible token cost, you can opt in to message-count
+tool-result messages with negligible token cost, adjust message-count
 compaction via the in-app `/config` command:
 
 ```text
 /config
 ```
 
-Select **Message-count compaction** and choose a threshold (`100`, `200`, `500`,
-or `1000`). Setting it to `off` (default) leaves only the built-in hard cap.
+Message-count compaction defaults to `200` messages. Select
+**Message-count compaction** to choose a different threshold (`100`, `500`, or
+`1000`), or set it to `off` to disable the setting's proactive guard. The
+built-in hard cap remains, and an `OPENCLAUDE_MAX_ACTIVE_MESSAGES` override
+remains active when configured.
 
-This setting is intended for power users debugging specific edge cases. Most
-users should leave it at `off`.
-
-The legacy `OPENCLAUDE_MAX_ACTIVE_MESSAGES` environment variable is still
-honored when the setting is `off`. `OPENCLAUDE_MAX_ACTIVE_MESSAGES_HARD_CAP`
+The legacy `OPENCLAUDE_MAX_ACTIVE_MESSAGES` environment variable is honored
+when the setting is unset or `off`. An explicit numeric setting takes
+precedence over that legacy value. `OPENCLAUDE_MAX_ACTIVE_MESSAGES_HARD_CAP`
 can override the safety cap; set it to `0` only for diagnostics.
 
 ### Long-session memory guard validation

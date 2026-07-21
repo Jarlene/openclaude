@@ -14,6 +14,7 @@ import {
   readCodexCredentialsAsync,
 } from '../utils/codexCredentials.js'
 import { isBareMode, isEnvTruthy } from '../utils/envUtils.js'
+import { isFirstPartyAnthropicBaseUrlForEnv } from '../utils/anthropicBaseUrl.js'
 import {
   parseProfileCustomHeadersInput,
   serializeProfileCustomHeaders,
@@ -198,8 +199,8 @@ const FORM_STEPS: Array<{
   {
     key: 'apiFormat',
     label: 'API mode',
-    placeholder: 'chat_completions',
-    helpText: 'Choose the OpenAI-compatible API surface for this provider.',
+    placeholder: 'automatic',
+    helpText: 'Automatically select the API surface, or choose one explicitly.',
     optional: true,
   },
   {
@@ -250,7 +251,7 @@ function toDraft(profile: ProviderProfile): ProviderDraft {
     baseUrl: profile.baseUrl,
     model: profile.model,
     apiKey: profile.apiKey ?? '',
-    apiFormat: profile.apiFormat ?? 'chat_completions',
+    apiFormat: profile.apiFormat ?? 'auto',
     authHeader: profile.authHeader ?? '',
     authHeaderValue: profile.authHeaderValue ?? '',
     customHeaders: serializeProfileCustomHeaders(profile.customHeaders) ?? '',
@@ -293,7 +294,11 @@ function presetToDraft(preset: ProviderPreset): ProviderDraft {
 }
 
 function isSetupPlaceholder(value: string): boolean {
-  return /\bYOUR[-_\s]/i.test(value) || /<[^>]+>/.test(value)
+  return (
+    /\bYOUR[-_\s]/i.test(value) ||
+    /<[^>]+>/.test(value) ||
+    /:\/\/[^/]+\.example(?:\/|$)/i.test(value)
+  )
 }
 
 function canUseStreamlinedPresetFlow(draft: ProviderDraft): boolean {
@@ -314,7 +319,7 @@ function profileSummary(profile: ProviderProfile, isActive: boolean): string {
       : `${models[0]}, ${models[1]} + ${models.length - 2} more`
   const modeInfo =
     routeSupportsApiFormatSelection(routeId)
-      ? ` · ${profile.apiFormat === 'responses_compat' ? 'responses (compat)' : profile.apiFormat === 'responses' ? 'responses' : 'chat/completions'}`
+      ? ` · ${profile.apiFormat === 'responses_compat' ? 'responses (compat)' : profile.apiFormat === 'responses' ? 'responses' : profile.apiFormat === 'chat_completions' ? 'chat/completions' : 'automatic'}`
       : ''
   const authInfo =
     routeSupportsAuthHeaders(routeId) && profile.authHeader
@@ -905,6 +910,16 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   const currentStep = formSteps[formStepIndex] ?? formSteps[0] ?? FORM_STEPS[0]
   const currentStepKey = currentStep.key
   const currentValue = draft[currentStepKey]
+  const displayStep =
+    draftProvider === 'custom-anthropic' && currentStepKey === 'apiKey'
+      ? {
+          ...currentStep,
+          label: 'Credential',
+          placeholder: 'Credential for this endpoint',
+          helpText: 'The custom profile stores this as an Authorization Bearer token.',
+          optional: false,
+        }
+      : currentStep
 
   // Memoize menu options to prevent unnecessary re-renders when navigating
   // the select menu. Without this, each arrow key press creates a new options
@@ -1566,7 +1581,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       baseUrl: defaults.baseUrl,
       model: defaults.model,
       apiKey: defaults.apiKey ?? '',
-      apiFormat: 'chat_completions',
+      apiFormat: preset === 'custom' ? 'auto' : 'chat_completions',
       authHeader: '',
       authHeaderValue: '',
       customHeaders: '',
@@ -1598,7 +1613,11 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       return
     }
 
-    if (preset === 'custom' || !canUseStreamlinedPresetFlow(nextDraft)) {
+    if (
+      preset === 'custom' ||
+      preset === 'custom-anthropic' ||
+      !canUseStreamlinedPresetFlow(nextDraft)
+    ) {
       setScreen('form')
       return
     }
@@ -1629,6 +1648,17 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     provider: ProviderProfile['provider'] = draftProvider,
     profileId: string | null = editingProfileId,
   ): void {
+    if (
+      provider === 'custom-anthropic' &&
+      (isSetupPlaceholder(nextDraft.baseUrl) ||
+        isFirstPartyAnthropicBaseUrlForEnv({
+          ANTHROPIC_BASE_URL: nextDraft.baseUrl,
+          USER_TYPE: process.env.USER_TYPE,
+        }))
+    ) {
+      setErrorMessage('Base URL must be a real Anthropic-compatible endpoint.')
+      return
+    }
     const routeId = resolveProviderEditorRouteId(provider, nextDraft.baseUrl)
     const supportsApiFormat = routeSupportsApiFormatSelection(routeId)
     const showsAuthHeader = routeShowsAuthHeader(routeId)
@@ -1644,17 +1674,21 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
 
     const requestedResponses =
       supportsApiFormat && (nextDraft.apiFormat === 'responses' || nextDraft.apiFormat === 'responses_compat')
-    const shouldUseChatCompletions =
-      !supportsApiFormat ||
-      (nextDraft.apiFormat !== 'responses' && nextDraft.apiFormat !== 'responses_compat') ||
-      !routeSupportsResponsesModel(routeId, nextDraft.model)
+    const selectedApiFormat =
+      !supportsApiFormat
+        ? 'chat_completions'
+        : nextDraft.apiFormat === 'auto'
+          ? undefined
+        : requestedResponses && !routeSupportsResponsesModel(routeId, nextDraft.model)
+          ? 'chat_completions'
+          : nextDraft.apiFormat as OpenAICompatibleApiFormat
     const payload: ProviderProfileInput = {
       provider,
       name: nextDraft.name,
       baseUrl: nextDraft.baseUrl,
       model: nextDraft.model,
       apiKey: nextDraft.apiKey,
-      apiFormat: shouldUseChatCompletions ? 'chat_completions' : (nextDraft.apiFormat as OpenAICompatibleApiFormat),
+      apiFormat: selectedApiFormat,
       authHeader:
         showsAuthHeader && nextDraft.authHeader
           ? nextDraft.authHeader
@@ -1908,8 +1942,8 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   function handleFormSubmit(value: string): void {
     const trimmed = value.trim()
 
-    if (!currentStep.optional && trimmed.length === 0) {
-      setErrorMessage(`${currentStep.label} is required.`)
+    if (!displayStep.optional && trimmed.length === 0) {
+      setErrorMessage(`${displayStep.label} is required.`)
       return
     }
 
@@ -2159,7 +2193,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         <Text color="remember" bold>
           {editingProfileId ? 'Edit provider profile' : 'Create provider profile'}
         </Text>
-        <Text dimColor>{currentStep.helpText}</Text>
+        <Text dimColor>{displayStep.helpText}</Text>
         <Text dimColor>
           Provider type:{' '}
           {getRouteProviderTypeLabel(resolveProfileRoute(draftProvider).routeId)}
@@ -2171,11 +2205,16 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
           </Text>
         ) : null}
         <Text dimColor>
-          Step {formStepIndex + 1} of {formSteps.length}: {currentStep.label}
+          Step {formStepIndex + 1} of {formSteps.length}: {displayStep.label}
         </Text>
         {currentStepKey === 'apiFormat' ? (
           <Select
             options={[
+              {
+                value: 'auto',
+                label: 'Automatic',
+                description: 'Use the provider and model defaults',
+              },
               {
                 value: 'chat_completions',
                 label: 'Chat Completions',
@@ -2193,14 +2232,14 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
               },
             ]}
             defaultValue={
-              currentValue === 'responses_compat' ? 'responses_compat' : currentValue === 'responses' ? 'responses' : 'chat_completions'
+              currentValue === 'responses_compat' ? 'responses_compat' : currentValue === 'responses' ? 'responses' : currentValue === 'chat_completions' ? 'chat_completions' : 'auto'
             }
             defaultFocusValue={
-              currentValue === 'responses_compat' ? 'responses_compat' : currentValue === 'responses' ? 'responses' : 'chat_completions'
+              currentValue === 'responses_compat' ? 'responses_compat' : currentValue === 'responses' ? 'responses' : currentValue === 'chat_completions' ? 'chat_completions' : 'auto'
             }
             onChange={(value: string) => handleFormSubmit(value)}
             onCancel={handleBackFromForm}
-            visibleOptionCount={3}
+            visibleOptionCount={4}
           />
         ) : (
           <Box flexDirection="row" gap={1}>
@@ -2216,7 +2255,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
               onSubmit={handleFormSubmit}
               focus={true}
               showCursor={true}
-              placeholder={`${currentStep.placeholder}${figures.ellipsis}`}
+              placeholder={`${displayStep.placeholder}${figures.ellipsis}`}
               mask={
                 currentStepKey === 'apiKey' ||
                 currentStepKey === 'authHeaderValue'
@@ -2380,7 +2419,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     const amountUsd = aimlapiTopupAmountUsd.trim()
     const parsedAmountUsd = Number(amountUsd)
     if (!trimmedEmail) {
-      setErrorMessage('AI/ML API email is required.')
+      setErrorMessage('aimlapi.com email is required.')
       setScreen('aimlapi-topup-email')
       return
     }
@@ -2390,17 +2429,17 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       return
     }
     if (Math.round(parsedAmountUsd * 100) < MIN_AMOUNT_USD_MINOR) {
-      setErrorMessage(`Minimum AI/ML API top-up is $${MIN_AMOUNT_USD_MINOR / 100}.`)
+      setErrorMessage(`Minimum aimlapi.com top-up is $${MIN_AMOUNT_USD_MINOR / 100}.`)
       setScreen('aimlapi-topup-amount')
       return
     }
     if (Math.round(parsedAmountUsd * 100) > MAX_AMOUNT_USD_MINOR) {
-      setErrorMessage(`Maximum AI/ML API top-up is $${MAX_AMOUNT_USD_MINOR / 100}.`)
+      setErrorMessage(`Maximum aimlapi.com top-up is $${MAX_AMOUNT_USD_MINOR / 100}.`)
       setScreen('aimlapi-topup-amount')
       return
     }
     if (!password) {
-      setErrorMessage('AI/ML API password is required.')
+      setErrorMessage('aimlapi.com password is required.')
       setScreen('aimlapi-topup-password')
       return
     }
@@ -2440,7 +2479,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error)
         setIsAimlapiTopupRunning(false)
-        setErrorMessage(`Could not finish AI/ML API top-up: ${detail}`)
+        setErrorMessage(`Could not finish aimlapi.com top-up: ${detail}`)
       }
     })()
   }
@@ -2452,7 +2491,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
           Create provider profile
         </Text>
         <Text dimColor>
-          Choose how to configure AI/ML API. Endpoint and model are already
+          Choose how to configure aimlapi.com. Endpoint and model are already
           configured.
         </Text>
         <Text dimColor>
@@ -2470,7 +2509,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
             {
               value: 'manual',
               label: 'Enter existing API key',
-              description: 'Paste a key you already have from AI/ML API',
+              description: 'Paste a key you already have from aimlapi.com',
             },
           ]}
           onChange={(value: string) => {
@@ -2509,10 +2548,10 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     return (
       <Box flexDirection="column" gap={1}>
         <Text color="remember" bold>
-          AI/ML API top-up
+          aimlapi.com top-up
         </Text>
         <Text dimColor>
-          Enter your AI/ML API account email. The checkout flow will use it to
+          Enter your aimlapi.com account email. The checkout flow will use it to
           register or sign in.
         </Text>
         <Text dimColor>Step 2 of 2: Top up account</Text>
@@ -2524,7 +2563,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
             onSubmit={value => {
               const email = value.trim()
               if (!email) {
-                setErrorMessage('AI/ML API email is required.')
+                setErrorMessage('aimlapi.com email is required.')
                 return
               }
               setAimlapiTopupEmail(email)
@@ -2552,7 +2591,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     return (
       <Box flexDirection="column" gap={1}>
         <Text color="remember" bold>
-          AI/ML API top-up
+          aimlapi.com top-up
         </Text>
         <Text dimColor>
           Choose a top-up amount in USD. Minimum is ${MIN_AMOUNT_USD_MINOR / 100}.
@@ -2571,11 +2610,11 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
                 return
               }
               if (Math.round(parsedAmountUsd * 100) < MIN_AMOUNT_USD_MINOR) {
-                setErrorMessage(`Minimum AI/ML API top-up is $${MIN_AMOUNT_USD_MINOR / 100}.`)
+                setErrorMessage(`Minimum aimlapi.com top-up is $${MIN_AMOUNT_USD_MINOR / 100}.`)
                 return
               }
               if (Math.round(parsedAmountUsd * 100) > MAX_AMOUNT_USD_MINOR) {
-                setErrorMessage(`Maximum AI/ML API top-up is $${MAX_AMOUNT_USD_MINOR / 100}.`)
+                setErrorMessage(`Maximum aimlapi.com top-up is $${MAX_AMOUNT_USD_MINOR / 100}.`)
                 return
               }
               setAimlapiTopupAmountUsd(amountUsd)
@@ -2602,10 +2641,10 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     return (
       <Box flexDirection="column" gap={1}>
         <Text color="remember" bold>
-          AI/ML API top-up
+          aimlapi.com top-up
         </Text>
         <Text dimColor>
-          Enter your AI/ML API password. The CLI will open checkout and save the
+          Enter your aimlapi.com password. The CLI will open checkout and save the
           issued API key after payment.
         </Text>
         <Text dimColor>Step 2 of 2: Top up account</Text>
@@ -2616,7 +2655,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
             onChange={setAimlapiTopupPassword}
             onSubmit={value => {
               if (!value) {
-                setErrorMessage('AI/ML API password is required.')
+                setErrorMessage('aimlapi.com password is required.')
                 return
               }
               setAimlapiTopupPassword(value)
@@ -2645,11 +2684,11 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     return (
       <Box flexDirection="column" gap={1}>
         <Text color="remember" bold>
-          AI/ML API top-up
+          aimlapi.com top-up
         </Text>
         <Text dimColor>
           Choose how to pay. The selected method decides which checkout invoice
-          AI/ML API opens.
+          aimlapi.com opens.
         </Text>
         <Text dimColor>Step 2 of 2: Payment method</Text>
         <Select
@@ -2685,9 +2724,9 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
 
   function renderAimlapiTopupProgress(): React.ReactNode {
     const labels: Record<AimlapiTopupStatus, string> = {
-      registering: 'Registering AI/ML API account...',
+      registering: 'Registering aimlapi.com account...',
       registered: 'Account registered.',
-      'signing-in': 'Signing in to AI/ML API...',
+      'signing-in': 'Signing in to aimlapi.com...',
       'signed-in': 'Signed in.',
       'creating-session': 'Creating checkout session...',
       'opening-checkout': 'Opening checkout...',
@@ -2696,12 +2735,12 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     }
     const status = aimlapiTopupStatus
       ? labels[aimlapiTopupStatus]
-      : 'Preparing AI/ML API top-up...'
+      : 'Preparing aimlapi.com top-up...'
 
     return (
       <Box flexDirection="column" gap={1}>
         <Text color="remember" bold>
-          AI/ML API top-up
+          aimlapi.com top-up
         </Text>
         <Text dimColor>{status}</Text>
         {aimlapiTopupDetail ? <Text>{aimlapiTopupDetail}</Text> : null}
